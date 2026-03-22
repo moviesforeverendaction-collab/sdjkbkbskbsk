@@ -56,14 +56,17 @@ class Config:
     # ── Redis (optional but recommended) ─────────────────────────
     REDIS_URL: str = os.environ.get("REDIS_URL", "")
 
-    # ── Streaming tuning ──────────────────────────────────────────
+    # Session file storage — mount a Railway Volume at /data so session files
+    # survive container restarts. Without this every restart = fresh Telegram
+    # auth = FloodWait risk. Set SESSION_DIR=/data in Railway Volume settings.
+    SESSION_DIR: str = os.environ.get("SESSION_DIR", "/data")
     # 1 MB chunks — sweet spot for single-session Telegram streaming.
     # Increasing beyond 2 MB gives diminishing returns and risks flood waits.
     CHUNK_SIZE: int = int(os.environ.get("CHUNK_SIZE", str(1024 * 1024)))
 
-    # How many chunks to pre-read ahead into memory before the client reads them.
-    # Keeps the pipe full; 3 is safe for Railway's RAM.
-    PREFETCH_CHUNKS: int = int(os.environ.get("PREFETCH_CHUNKS", "3"))
+    # How many 1 MB chunks to pre-buffer ahead of the HTTP writer.
+    # 8 = 8 MB queued in RAM — keeps the pipe full, maximizes throughput.
+    PREFETCH_CHUNKS: int = int(os.environ.get("PREFETCH_CHUNKS", "8"))
 
     # Max concurrent streaming connections per server worker.
     MAX_CONCURRENT: int = int(os.environ.get("MAX_CONCURRENT", "20"))
