@@ -87,11 +87,10 @@ async def handle_download(request: web.Request) -> web.StreamResponse:
         "Content-Disposition": f'attachment; filename="{file_name}"',
         "Accept-Ranges": "bytes" if known_size else "none",
         "Cache-Control": "no-store",
-        # Critical for Railway/nginx proxies — tells the proxy NOT to buffer
-        # the entire response before forwarding. Without this the client sees
-        # nothing until the whole file is downloaded to the proxy first.
+        # Tells Railway/nginx NOT to buffer the whole file before forwarding.
+        # Do NOT add Transfer-Encoding: chunked — aiohttp sets it automatically
+        # for StreamResponse, and combining it with Content-Length violates HTTP/1.1.
         "X-Accel-Buffering": "no",
-        "Transfer-Encoding": "chunked",
     }
     if known_size:
         headers["Content-Length"] = str(content_length)
@@ -128,10 +127,15 @@ async def handle_download(request: web.Request) -> web.StreamResponse:
             await resp.write(chunk)
             bytes_sent += len(chunk)
         completed = True
-    except (ConnectionResetError, asyncio.CancelledError):
-        pass  # Client disconnected — perfectly normal
+    except (ConnectionResetError, asyncio.CancelledError, ConnectionError):
+        pass  # Client disconnected or cancelled — perfectly normal
     except Exception as exc:
-        log.error("Streaming error for token %s: %s", token, exc)
+        err = str(exc)
+        # "Connection lost" is a normal browser disconnect/retry — not an error
+        if "connection lost" in err.lower() or "connection reset" in err.lower():
+            pass
+        else:
+            log.error("Streaming error for token %s: %s", token, exc)
 
     # Only count as a completed download if the full stream finished cleanly
     if completed:
