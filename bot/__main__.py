@@ -1,3 +1,6 @@
+# !! MUST be the very first import — patches pyrogram before anything else loads
+import bot.patches  # noqa: F401
+
 import asyncio
 import logging
 import platform
@@ -5,17 +8,7 @@ import signal
 import sys
 import time
 
-import pyrogram.utils
-# ── Patch Pyrogram's hardcoded MIN_CHANNEL_ID ────────────────────────────────
-# Pyrogram 2.0.106 has MIN_CHANNEL_ID = -1002147483647.
-# Telegram now issues channel IDs more negative than that (e.g. -1003144372708).
-# Pyrogram rejects them locally before even contacting Telegram, causing
-# "Peer id invalid". Patching the constant fixes it permanently.
-# See: https://github.com/pyrogram/pyrogram/pull/1430
-pyrogram.utils.MIN_CHANNEL_ID = -1007852516352
-pyrogram.utils.MIN_CHAT_ID = -999999999999
-# ─────────────────────────────────────────────────────────────────────────────
-
+import pyrogram
 import uvloop
 
 from bot.config import Config
@@ -43,63 +36,6 @@ async def _cleanup_loop() -> None:
                 log.info("Cleanup sweep: removed %d expired link(s).", deleted)
         except Exception as exc:
             log.warning("Cleanup sweep error: %s", exc)
-
-
-async def main() -> None:
-    Config.validate()
-
-    log.info("Starting FileStreamBot...")
-    log.info("  API apps configured: %d", len(Config.api_pairs()))
-    log.info("  Chunk size: %d KB", Config.CHUNK_SIZE // 1024)
-    log.info("  Prefetch chunks: %d", Config.PREFETCH_CHUNKS)
-
-    await ensure_indexes()
-    log.info("  MongoDB indexes ready.")
-
-    pool = ClientPool()
-    await pool.start()
-
-    # Verify channel is accessible now that the MIN_CHANNEL_ID patch is applied
-    try:
-        chat = await pool.primary().get_chat(Config.CHANNEL_ID)
-        log.info("  Storage channel: %s (id=%s)", chat.title, chat.id)
-    except Exception as exc:
-        log.error(
-            "  Could not access storage channel %s: %s\n"
-            "  Make sure the bot is an ADMIN of the channel.",
-            Config.CHANNEL_ID, exc
-        )
-        await pool.stop()
-        return
-
-    register_handlers(pool.primary())
-
-    runner = await start_server(pool)
-
-    # Send startup message to channel
-    await _send_startup_log(pool, chat)
-
-    cleanup_task = asyncio.create_task(_cleanup_loop())
-
-    log.info("Bot is running.")
-
-    stop = asyncio.Event()
-
-    def _handle_signal(*_):
-        log.info("Shutdown signal received.")
-        stop.set()
-
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _handle_signal)
-
-    await stop.wait()
-
-    log.info("Shutting down...")
-    cleanup_task.cancel()
-    await runner.cleanup()
-    await pool.stop()
-    log.info("Bye!")
 
 
 async def _send_startup_log(pool: ClientPool, chat: object) -> None:
@@ -131,6 +67,62 @@ async def _send_startup_log(pool: ClientPool, chat: object) -> None:
         log.info("  Startup log sent to channel.")
     except Exception as exc:
         log.warning("  Could not send startup log: %s", exc)
+
+
+async def main() -> None:
+    Config.validate()
+
+    log.info("Starting FileStreamBot...")
+    log.info("  Pyrogram MIN_CHANNEL_ID patched to: %s", pyrogram.utils.MIN_CHANNEL_ID)
+    log.info("  API apps configured: %d", len(Config.api_pairs()))
+    log.info("  Chunk size: %d KB", Config.CHUNK_SIZE // 1024)
+    log.info("  Prefetch chunks: %d", Config.PREFETCH_CHUNKS)
+
+    await ensure_indexes()
+    log.info("  MongoDB indexes ready.")
+
+    pool = ClientPool()
+    await pool.start()
+
+    try:
+        chat = await pool.primary().get_chat(Config.CHANNEL_ID)
+        log.info("  Storage channel: %s (id=%s)", chat.title, chat.id)
+    except Exception as exc:
+        log.error(
+            "  Could not access storage channel %s: %s\n"
+            "  Make sure the bot is an ADMIN of the channel.",
+            Config.CHANNEL_ID, exc
+        )
+        await pool.stop()
+        return
+
+    register_handlers(pool.primary())
+
+    runner = await start_server(pool)
+
+    await _send_startup_log(pool, chat)
+
+    cleanup_task = asyncio.create_task(_cleanup_loop())
+
+    log.info("Bot is running.")
+
+    stop = asyncio.Event()
+
+    def _handle_signal(*_):
+        log.info("Shutdown signal received.")
+        stop.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, _handle_signal)
+
+    await stop.wait()
+
+    log.info("Shutting down...")
+    cleanup_task.cancel()
+    await runner.cleanup()
+    await pool.stop()
+    log.info("Bye!")
 
 
 if __name__ == "__main__":
