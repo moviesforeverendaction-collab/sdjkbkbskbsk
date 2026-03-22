@@ -6,34 +6,15 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
+    env_file:
+      - .env
     environment:
-      # ── Required ────────────────────────────────────────────────
-      BOT_TOKEN: ${BOT_TOKEN}
-      API_ID: ${API_ID}
-      API_HASH: ${API_HASH}
-      CHANNEL_ID: ${CHANNEL_ID}
-      OWNER_IDS: ${OWNER_IDS}
-      BASE_URL: ${BASE_URL}
-
-      # ── Database (points to the mongo service below) ─────────────
+      # These override anything in .env — internal Docker service addresses.
+      # Defined here so they always point to the correct container names.
       MONGO_URI: mongodb://mongo:27017
       DB_NAME: filestreambot
-
-      # ── Redis (points to the redis service below) ────────────────
       REDIS_URL: redis://redis:6379
-
-      # ── Optional second API app ──────────────────────────────────
-      API_ID_2: ${API_ID_2:-}
-      API_HASH_2: ${API_HASH_2:-}
-
-      # ── Tuning (safe defaults) ───────────────────────────────────
-      CHUNK_SIZE: ${CHUNK_SIZE:-1048576}
-      PREFETCH_CHUNKS: ${PREFETCH_CHUNKS:-3}
-      MAX_CONCURRENT: ${MAX_CONCURRENT:-20}
-      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-10}
-      OWNER_ONLY_UPLOAD: ${OWNER_ONLY_UPLOAD:-false}
-      PORT: 8080
-
+      PORT: "8080"
     depends_on:
       mongo:
         condition: service_healthy
