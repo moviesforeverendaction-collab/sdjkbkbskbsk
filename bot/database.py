@@ -1,4 +1,5 @@
-import secrets
+import random
+import string
 import time
 from typing import Optional
 
@@ -17,6 +18,8 @@ EXPIRY_OPTIONS: dict[str, Optional[int]] = {
     "30d":   2592000,
     "never": None,
 }
+
+_CHARS = string.ascii_letters + string.digits  # 62 chars
 
 
 def _db():
@@ -39,15 +42,16 @@ async def ensure_indexes() -> None:
     await col.create_index("token", unique=True, background=True)
     await col.create_index("file_unique_id", background=True)
     await col.create_index("uploader_id", background=True)
-    await col.create_index("expires_at", expireAfterSeconds=0, background=True, sparse=True)
-
-    # User settings collection
+    await col.create_index(
+        "expires_at", expireAfterSeconds=0, background=True, sparse=True
+    )
     ucol = _db()["users"]
     await ucol.create_index("user_id", unique=True, background=True)
 
 
-def _make_token(length: int = 24) -> str:
-    return secrets.token_urlsafe(length)
+def _make_token() -> str:
+    """Short 8-char alphanumeric token — 62^8 = 218 trillion combinations."""
+    return "".join(random.choices(_CHARS, k=8))
 
 
 async def save_file(
@@ -65,24 +69,31 @@ async def save_file(
     expires_at = (now + expires_in) if expires_in else None
 
     if expires_at is None:
-        existing = await col.find_one({"file_unique_id": file_unique_id, "expires_at": None})
+        existing = await col.find_one(
+            {"file_unique_id": file_unique_id, "expires_at": None}
+        )
         if existing:
             return existing["token"]
 
-    token = _make_token()
+    # Collision-safe token generation
+    for _ in range(10):
+        token = _make_token()
+        if not await col.find_one({"token": token}):
+            break
+
     await col.insert_one({
-        "token":          token,
-        "file_id":        file_id,
-        "file_unique_id": file_unique_id,
-        "file_name":      file_name,
-        "file_size":      file_size,
-        "mime_type":      mime_type,
-        "message_id":     message_id,
-        "uploader_id":    uploader_id,
-        "created_at":     now,
-        "expires_in":     expires_in,
-        "expires_at":     expires_at,
-        "downloads":      0,
+        "token":           token,
+        "file_id":         file_id,
+        "file_unique_id":  file_unique_id,
+        "file_name":       file_name,
+        "file_size":       file_size,
+        "mime_type":       mime_type,
+        "message_id":      message_id,
+        "uploader_id":     uploader_id,
+        "created_at":      now,
+        "expires_in":      expires_in,
+        "expires_at":      expires_at,
+        "downloads":       0,
         "god_speed_ready": False,
     })
     return token
@@ -92,18 +103,22 @@ async def get_file(token: str) -> Optional[dict]:
     doc = await _db()["files"].find_one({"token": token}, {"_id": 0})
     if doc is None:
         return None
-    expires_at = doc.get("expires_at")
-    if expires_at and int(time.time()) > expires_at:
+    ea = doc.get("expires_at")
+    if ea and int(time.time()) > ea:
         return None
     return doc
 
 
 async def mark_god_speed_ready(token: str) -> None:
-    await _db()["files"].update_one({"token": token}, {"$set": {"god_speed_ready": True}})
+    await _db()["files"].update_one(
+        {"token": token}, {"$set": {"god_speed_ready": True}}
+    )
 
 
 async def increment_downloads(token: str) -> None:
-    await _db()["files"].update_one({"token": token}, {"$inc": {"downloads": 1}})
+    await _db()["files"].update_one(
+        {"token": token}, {"$inc": {"downloads": 1}}
+    )
 
 
 async def delete_file(token: str) -> bool:
@@ -121,13 +136,9 @@ async def user_file_count(uploader_id: int) -> int:
     return await _db()["files"].count_documents({"uploader_id": uploader_id})
 
 
-# ── User settings ─────────────────────────────────────────────────────────────
-
 async def get_user_settings(user_id: int) -> dict:
     doc = await _db()["users"].find_one({"user_id": user_id}, {"_id": 0})
-    if doc is None:
-        return {"user_id": user_id, "god_speed": False}
-    return doc
+    return doc if doc else {"user_id": user_id, "god_speed": False}
 
 
 async def set_god_speed(user_id: int, enabled: bool) -> None:
@@ -139,5 +150,5 @@ async def set_god_speed(user_id: int, enabled: bool) -> None:
 
 
 async def is_god_speed_enabled(user_id: int) -> bool:
-    settings = await get_user_settings(user_id)
-    return settings.get("god_speed", False)
+    s = await get_user_settings(user_id)
+    return s.get("god_speed", False)
