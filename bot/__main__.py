@@ -1,11 +1,9 @@
-"""
-Entry point.  Run with:  python -m bot
-"""
-
 import asyncio
 import logging
+import platform
 import signal
 import sys
+import time
 
 import uvloop
 
@@ -21,6 +19,40 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger(__name__)
+
+_BOOT_TIME = time.time()
+
+
+async def _send_startup_message(pool: ClientPool, chat: object) -> None:
+    """Send a detailed startup report to the storage channel."""
+    import pyrogram
+    pairs = Config.api_pairs()
+    uptime_ts = int(_BOOT_TIME)
+
+    text = (
+        "🟢 **FileStreamBot Started**\n"
+        "─────────────────────────\n"
+        f"🤖 **Channel:** {getattr(chat, 'title', '?')} (`{getattr(chat, 'id', '?')}`)\n"
+        f"🔑 **API Apps:** {len(pairs)} client(s) active\n"
+        f"📦 **Chunk Size:** {Config.CHUNK_SIZE // 1024} KB\n"
+        f"⚡ **Prefetch:** {Config.PREFETCH_CHUNKS} chunks\n"
+        f"🌐 **Base URL:** `{Config.BASE_URL}`\n"
+        f"🗄 **DB:** `{Config.DB_NAME}`\n"
+        f"🔴 **Redis:** {'enabled' if Config.REDIS_URL else 'disabled'}\n"
+        f"👑 **Owners:** {len(Config.OWNER_IDS)} configured\n"
+        f"🔒 **Upload restricted:** {'yes' if Config.OWNER_ONLY_UPLOAD else 'no (anyone can upload)'}\n"
+        "─────────────────────────\n"
+        f"🐍 Python `{platform.python_version()}` · "
+        f"Pyrogram `{pyrogram.__version__}`\n"
+        f"🖥 `{platform.system()} {platform.release()}`\n"
+        f"🕐 Started at `{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(uptime_ts))}`"
+    )
+
+    try:
+        await pool.primary().send_message(Config.CHANNEL_ID, text)
+        log.info("  Startup message sent to channel.")
+    except Exception as exc:
+        log.warning("  Could not send startup message to channel: %s", exc)
 
 
 async def _cleanup_loop() -> None:
@@ -75,6 +107,9 @@ async def main() -> None:
 
     # Start aiohttp web server
     runner = await start_server(pool)
+
+    # Send startup report to the storage channel
+    await _send_startup_message(pool, chat)
 
     # Start hourly expired-link cleanup in the background
     cleanup_task = asyncio.create_task(_cleanup_loop())
