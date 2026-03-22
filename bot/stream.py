@@ -1,13 +1,14 @@
 """
-Streaming engine — Kurigram (Pyrogram fork).
+Streaming engine — Kurigram 2.2.x
 
-stream_media() API (Kurigram 2.2.x):
-  offset (int) — number of 1 MB chunks to skip (NOT a byte offset)
-  limit  (int) — number of chunks to stream; 0 = stream everything
+stream_media(offset, limit):
+  offset = chunk index to start from (1 chunk = 1 MB)
+  limit  = number of chunks to fetch (0 = all)
 
-We receive a byte offset from the HTTP Range header and convert:
-  chunk_index = byte_offset // 1_048_576
-  skip_bytes  = byte_offset %  1_048_576  (trim the first chunk)
+Speed strategy:
+  - PREFETCH_CHUNKS=8 keeps 8 MB queued ahead of the HTTP writer
+  - bytes(chunk) ensures we own the buffer before the MTProto layer recycles it
+  - filler task is properly awaited on cancel to avoid "Task destroyed" warnings
 """
 
 import asyncio
@@ -21,33 +22,34 @@ from bot.config import Config
 
 log = logging.getLogger(__name__)
 
-# Telegram's fixed internal chunk size — always 1 MiB, cannot be changed.
-TGRAM_CHUNK = 1024 * 1024  # 1 MB
+TGRAM_CHUNK = 1024 * 1024  # Telegram's fixed 1 MB chunk size
 
 
 async def iter_file(
     client: Client,
     message_id: int,
     channel_id: int,
-    offset: int = 0,            # byte offset from HTTP Range header
+    offset: int = 0,
 ) -> AsyncGenerator[bytes, None]:
     """
-    Async generator that yields file bytes from Telegram.
-    Handles HTTP Range byte offsets by converting to chunk index.
+    Yields file bytes from Telegram.
+    offset is a BYTE offset (from HTTP Range); converted to chunk index internally.
     """
     try:
         message = await client.get_messages(channel_id, message_id)
     except Exception as exc:
-        log.error("get_messages failed for msg %s: %s", message_id, exc)
+        log.error("get_messages failed msg=%s: %s", message_id, exc)
         return
 
     if message is None or message.empty:
         log.warning("Message %s not found in channel", message_id)
         return
 
-    chunk_index = offset // TGRAM_CHUNK   # which 1 MB chunk to start from
-    skip_bytes  = offset %  TGRAM_CHUNK   # bytes to trim from the first chunk
+    chunk_index = offset // TGRAM_CHUNK
+    skip_bytes  = offset %  TGRAM_CHUNK
 
+    # Generous buffer — keeps the HTTP pipe full while Telegram fetches next chunk.
+    # Each slot = 1 MB, so PREFETCH_CHUNKS=8 = 8 MB pre-queued in RAM.
     buffer: asyncio.Queue[Optional[bytes]] = asyncio.Queue(
         maxsize=Config.PREFETCH_CHUNKS
     )
@@ -60,22 +62,23 @@ async def iter_file(
                     async for chunk in client.stream_media(
                         message,
                         offset=chunk_index,
-                        limit=0,    # 0 = all chunks from offset onward
+                        limit=0,
                     ):
+                        data = bytes(chunk)  # own the buffer before MTProto recycles it
                         if first:
                             first = False
                             if skip_bytes:
-                                chunk = chunk[skip_bytes:]
-                        if chunk:
-                            await buffer.put(bytes(chunk))
-                    break   # stream finished cleanly
+                                data = data[skip_bytes:]
+                        if data:
+                            await buffer.put(data)
+                    break  # clean finish
                 except FloodWait as fw:
-                    log.warning("FloodWait %ds on msg %s — waiting", fw.value, message_id)
+                    log.warning("FloodWait %ds on msg %s", fw.value, message_id)
                     await asyncio.sleep(fw.value)
         except asyncio.CancelledError:
             pass
         except Exception as exc:
-            log.error("Stream fill error for msg %s: %s", message_id, exc)
+            log.error("Fill error msg=%s: %s", message_id, exc)
         finally:
             await buffer.put(None)  # always signal end
 
@@ -88,23 +91,29 @@ async def iter_file(
             yield chunk
     except asyncio.CancelledError:
         filler.cancel()
+        # Properly await the cancellation so the task is not left pending
+        try:
+            await asyncio.wait_for(asyncio.shield(filler), timeout=2.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
         raise
     finally:
         if not filler.done():
             filler.cancel()
+            # Drain the buffer so the filler task can exit cleanly
+            try:
+                await asyncio.wait_for(filler, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
 
 
 def parse_range_header(
     range_header: Optional[str], file_size: int
 ) -> tuple[int, int]:
-    """
-    Parse HTTP Range header → (start_byte, end_byte).
-    Returns (0, file_size-1) when header is absent or invalid.
-    """
     if not range_header or not range_header.startswith("bytes="):
         return 0, file_size - 1
     try:
-        spec = range_header[6:]                     # strip "bytes="
+        spec = range_header[6:]
         start_s, _, end_s = spec.partition("-")
         start = int(start_s) if start_s else 0
         end   = int(end_s)   if end_s   else file_size - 1
