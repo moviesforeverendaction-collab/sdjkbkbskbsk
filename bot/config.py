@@ -66,10 +66,10 @@ class Config:
 
     # How many 1 MB chunks to pre-buffer ahead of the HTTP writer.
     # 8 = 8 MB queued in RAM — keeps the pipe full, maximizes throughput.
-    PREFETCH_CHUNKS: int = int(os.environ.get("PREFETCH_CHUNKS", "8"))
+    PREFETCH_CHUNKS: int = int(os.environ.get("PREFETCH_CHUNKS", "15"))
 
     # Max concurrent streaming connections per server worker.
-    MAX_CONCURRENT: int = int(os.environ.get("MAX_CONCURRENT", "20"))
+    MAX_CONCURRENT: int = int(os.environ.get("MAX_CONCURRENT", "50"))
 
     # ── Safety / rate-limiting ────────────────────────────────────
     # Max downloads per unique IP per minute (simple in-memory counter).
