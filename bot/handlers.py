@@ -35,7 +35,10 @@ log = logging.getLogger(__name__)
 # Pending uploads waiting for expiry selection
 # (user_id, msg_id) → (Message, monotonic_timestamp)
 _pending: dict[tuple[int, int], tuple[Message, float]] = {}
-_PENDING_TTL = 600  # 10 minutes
+_PENDING_TTL = 600
+
+# Set by __main__ after pool starts — gives God Speed access to both clients
+_GOD_SPEED_CLIENT2 = None  # 10 minutes
 
 
 def _is_owner(uid: int) -> bool:
@@ -413,9 +416,11 @@ def register_handlers(client: Client) -> None:
                     f"📦 {_fmt_size(file_size)}\n\n"
                     "_Downloading to Railway disk. Link ready when done._"
                 )
+                # Pass both clients for parallel 8-worker download
                 asyncio.create_task(_god_speed_task(
                     client, forwarded.id, token, file_name,
-                    file_size, expiry_label, expiry_str, link, status
+                    file_size, expiry_label, expiry_str, link, status,
+                    client2=_GOD_SPEED_CLIENT2,
                 ))
             else:
                 # Standard: link is ready now
@@ -447,6 +452,7 @@ async def _god_speed_task(
     expiry_str: str,
     link: str,
     status_msg,
+    client2=None,
 ) -> None:
     """Background task: download to disk, then update the message with the link."""
     from bot.stream import download_to_cache
@@ -479,6 +485,7 @@ async def _god_speed_task(
             channel_id=Config.CHANNEL_ID,
             token=token,
             progress_cb=_progress,
+            client2=client2,
         )
         await database.mark_god_speed_ready(token)
 
