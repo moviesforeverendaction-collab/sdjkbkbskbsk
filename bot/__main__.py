@@ -98,6 +98,12 @@ async def main() -> None:
 
     register_handlers(pool.primary())
 
+    # Give handlers access to client2 for parallel God Speed downloads
+    if pool.count >= 2:
+        import bot.handlers as _h
+        _h._GOD_SPEED_CLIENT2 = pool._clients[1]
+        log.info("  God Speed parallel download: 2 clients × 4 workers = 8 connections")
+
     runner = await start_server(pool)
 
     await _send_startup_log(pool, chat)
