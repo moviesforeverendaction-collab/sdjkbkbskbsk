@@ -86,7 +86,12 @@ async def handle_download(request: web.Request) -> web.StreamResponse:
         "Content-Type": mime_type,
         "Content-Disposition": f'attachment; filename="{file_name}"',
         "Accept-Ranges": "bytes" if known_size else "none",
-        "Cache-Control": "public, max-age=3600",
+        "Cache-Control": "no-store",
+        # Critical for Railway/nginx proxies — tells the proxy NOT to buffer
+        # the entire response before forwarding. Without this the client sees
+        # nothing until the whole file is downloaded to the proxy first.
+        "X-Accel-Buffering": "no",
+        "Transfer-Encoding": "chunked",
     }
     if known_size:
         headers["Content-Length"] = str(content_length)
