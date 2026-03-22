@@ -49,7 +49,8 @@ class Config:
     BASE_URL: str = os.environ.get("BASE_URL", "").rstrip("/")
 
     # ── Database ──────────────────────────────────────────────────
-    MONGO_URI: str = os.environ.get("MONGO_URI", "")
+    # Railway injects MONGO_URL; fallback to MONGO_URI for other providers
+    MONGO_URI: str = os.environ.get("MONGO_URL") or os.environ.get("MONGO_URI", "")
     DB_NAME: str = os.environ.get("DB_NAME", "filestreambot")
 
     # ── Redis (optional but recommended) ─────────────────────────
@@ -78,10 +79,13 @@ class Config:
     @classmethod
     def validate(cls) -> None:
         missing = []
-        for field in ("BOT_TOKEN", "API_ID", "API_HASH", "CHANNEL_ID", "MONGO_URI", "BASE_URL"):
+        for field in ("BOT_TOKEN", "API_ID", "API_HASH", "CHANNEL_ID", "BASE_URL"):
             val = getattr(cls, field)
             if not val or val in (0, "0", ""):
                 missing.append(field)
+        # Check Mongo separately since it can come from either var name
+        if not cls.MONGO_URI:
+            missing.append("MONGO_URL or MONGO_URI")
         if missing:
             raise EnvironmentError(
                 f"Missing required environment variables: {', '.join(missing)}\n"
