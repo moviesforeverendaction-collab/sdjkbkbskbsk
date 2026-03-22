@@ -241,57 +241,136 @@ async def iter_cached_file(
             yield data
 
 
-# ── God Speed: download file to disk ─────────────────────────────────────────
+# ── God Speed: parallel multi-client download to disk ────────────────────────
 
 async def download_to_cache(
     client: Client,
     message_id: int,
     channel_id: int,
     token: str,
-    progress_cb=None,   # async callable(done_bytes, total_bytes)
+    progress_cb=None,
+    client2: Client = None,
 ) -> Path:
     """
-    Download entire file to Railway disk.
-    progress_cb must be an async function.
-    Returns path to cached file.
+    Download file to Railway disk using parallel workers.
+    With 2 clients x 4 workers = 8 parallel Telegram connections.
+    Each connection ~5 MB/s -> theoretical 40 MB/s, real ~20-50 MB/s.
     """
     path = cache_path(token)
     if path.exists():
         return path
 
     tmp = path.with_suffix(".tmp")
-    done = 0
 
     try:
-        msg = await client.get_messages(channel_id, message_id)
-        if msg is None or msg.empty:
+        msg1 = await client.get_messages(channel_id, message_id)
+        if msg1 is None or msg1.empty:
             raise ValueError(f"Message {message_id} not found")
 
-        media = (msg.document or msg.video or msg.audio or msg.voice
-                 or msg.animation or msg.video_note or msg.photo)
-        total = getattr(media, "file_size", 0) or 0
+        msg2 = None
+        if client2 is not None:
+            try:
+                msg2 = await client2.get_messages(channel_id, message_id)
+                if msg2 and msg2.empty:
+                    msg2 = None
+            except Exception:
+                msg2 = None
 
-        with open(tmp, "wb") as f:
-            while True:
-                try:
-                    async for chunk in client.stream_media(msg, offset=0, limit=0):
-                        data = bytes(chunk)
-                        f.write(data)
-                        done += len(data)
-                        if progress_cb:
-                            await progress_cb(done, total)
-                    break
-                except FloodWait as fw:
-                    log.warning("FloodWait %ds during God Speed download", fw.value)
-                    await asyncio.sleep(fw.value)
+        media = (msg1.document or msg1.video or msg1.audio or msg1.voice
+                 or msg1.animation or msg1.video_note or msg1.photo)
+        total_bytes = getattr(media, "file_size", 0) or 0
 
+        if total_bytes == 0:
+            done = 0
+            with open(tmp, "wb") as f:
+                while True:
+                    try:
+                        async for chunk in client.stream_media(msg1, offset=0, limit=0):
+                            data = bytes(chunk)
+                            f.write(data)
+                            done += len(data)
+                            if progress_cb:
+                                await progress_cb(done, 0)
+                        break
+                    except FloodWait as fw:
+                        await asyncio.sleep(fw.value)
+            tmp.rename(path)
+            return path
+
+        total_chunks = (total_bytes + TGRAM_CHUNK - 1) // TGRAM_CHUNK
+        WORKERS_PER_CLIENT = 4
+        clients_msgs = [(client, msg1)] * WORKERS_PER_CLIENT
+        if msg2 is not None:
+            clients_msgs += [(client2, msg2)] * WORKERS_PER_CLIENT
+
+        n_workers = len(clients_msgs)
+        chunks_per_worker = (total_chunks + n_workers - 1) // n_workers
+        done_bytes = [0]
+        seg_files = []
+
+        async def _worker(idx: int, cli: Client, msg, start_chunk: int, end_chunk: int) -> None:
+            seg_path = tmp.with_suffix(f".seg{idx}")
+            seg_files.append((idx, seg_path))
+            n = end_chunk - start_chunk
+            if n <= 0:
+                return
+            loop = asyncio.get_event_loop()
+            with open(seg_path, "wb") as f:
+                chunk_idx = start_chunk
+                while chunk_idx < end_chunk:
+                    remaining = end_chunk - chunk_idx
+                    try:
+                        async for raw in cli.stream_media(msg, offset=chunk_idx, limit=remaining):
+                            data = bytes(raw)
+                            await loop.run_in_executor(None, f.write, data)
+                            done_bytes[0] += len(data)
+                            if progress_cb:
+                                await progress_cb(done_bytes[0], total_bytes)
+                            chunk_idx += 1
+                        break
+                    except FloodWait as fw:
+                        log.warning("God Speed FloodWait %ds worker %d", fw.value, idx)
+                        await asyncio.sleep(fw.value)
+                    except Exception as exc:
+                        log.error("God Speed worker %d error: %s", idx, exc)
+                        raise
+
+        tasks = []
+        for i, (cli, msg) in enumerate(clients_msgs):
+            s = i * chunks_per_worker
+            e = min(s + chunks_per_worker, total_chunks)
+            if s >= total_chunks:
+                break
+            tasks.append(asyncio.create_task(_worker(i, cli, msg, s, e)))
+
+        await asyncio.gather(*tasks)
+
+        seg_files.sort(key=lambda x: x[0])
+        loop = asyncio.get_event_loop()
+
+        def _assemble():
+            with open(tmp, "wb") as out:
+                for _, seg in seg_files:
+                    if seg.exists():
+                        with open(seg, "rb") as s:
+                            while True:
+                                buf = s.read(4 * 1024 * 1024)
+                                if not buf:
+                                    break
+                                out.write(buf)
+                        seg.unlink()
+
+        await loop.run_in_executor(None, _assemble)
         tmp.rename(path)
-        log.info("God Speed cached %s — %d MB", token, done // (1024 * 1024))
+        log.info("God Speed cached %s — %d MB", token, total_bytes // (1024 * 1024))
         return path
 
     except Exception:
-        if tmp.exists():
-            tmp.unlink(missing_ok=True)
+        for f in tmp.parent.glob(f"{tmp.stem}*"):
+            try:
+                f.unlink()
+            except Exception:
+                pass
         raise
 
 
