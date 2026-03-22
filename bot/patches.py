@@ -1,14 +1,10 @@
 """
-Apply patches to third-party libraries before anything else runs.
-Import this module at the very top of __main__.py.
+Patches applied before any Pyrogram/Kurigram code runs.
 
-Pyrogram 2.0.106 hardcodes MIN_CHANNEL_ID = -1002147483647.
-Telegram now issues channel IDs more negative than that limit
-(e.g. -1003144372708), causing "Peer id invalid" errors locally
-before Pyrogram even contacts Telegram. This patch extends the limit.
-Reference: https://github.com/pyrogram/pyrogram/issues/1327
+Kurigram 2.2.x still inherits MIN_CHANNEL_ID from Pyrogram's utils.
+Telegram now issues channel IDs more negative than -1002147483647,
+so we extend the limit to cover all current and future channel IDs.
 """
-
 import pyrogram.utils
 
 pyrogram.utils.MIN_CHANNEL_ID = -1007852516352
