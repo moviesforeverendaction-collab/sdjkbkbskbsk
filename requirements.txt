@@ -1,0 +1,19 @@
+# Core Telegram client
+pyrogram==2.0.106
+TgCrypto==1.2.6
+
+# Async MongoDB driver
+motor==3.3.2
+
+# Web server
+aiohttp==3.9.5
+aiohttp-cors==0.7.0
+
+# Fast event loop (Linux/Railway only)
+uvloop==0.19.0
+
+# Env vars
+python-dotenv==1.0.1
+
+# Redis cache (optional)
+redis==5.0.4

@@ -1,0 +1,67 @@
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # ── Required ────────────────────────────────────────────────
+      BOT_TOKEN: ${BOT_TOKEN}
+      API_ID: ${API_ID}
+      API_HASH: ${API_HASH}
+      CHANNEL_ID: ${CHANNEL_ID}
+      OWNER_IDS: ${OWNER_IDS}
+      BASE_URL: ${BASE_URL}
+
+      # ── Database (points to the mongo service below) ─────────────
+      MONGO_URI: mongodb://mongo:27017
+      DB_NAME: filestreambot
+
+      # ── Redis (points to the redis service below) ────────────────
+      REDIS_URL: redis://redis:6379
+
+      # ── Optional second API app ──────────────────────────────────
+      API_ID_2: ${API_ID_2:-}
+      API_HASH_2: ${API_HASH_2:-}
+
+      # ── Tuning (safe defaults) ───────────────────────────────────
+      CHUNK_SIZE: ${CHUNK_SIZE:-1048576}
+      PREFETCH_CHUNKS: ${PREFETCH_CHUNKS:-3}
+      MAX_CONCURRENT: ${MAX_CONCURRENT:-20}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-10}
+      OWNER_ONLY_UPLOAD: ${OWNER_ONLY_UPLOAD:-false}
+      PORT: 8080
+
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  mongo:
+    image: mongo:7.0
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7.2-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  mongo_data:
+  redis_data:
