@@ -3,7 +3,6 @@ FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
-# Install build deps needed for TgCrypto and uvloop C extensions
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
@@ -19,23 +18,23 @@ FROM python:3.11-slim AS runtime
 
 WORKDIR /app
 
-# Copy installed packages from builder — keeps final image lean
 COPY --from=builder /install /usr/local
-
-# Copy source
 COPY bot/ ./bot/
 
-# /tmp is used for Pyrogram session files (ephemeral — fine for bots)
-# No other writable volume needed.
-RUN mkdir -p /tmp && chmod 1777 /tmp
+# Create non-root user
+RUN useradd -r -u 1001 -s /sbin/nologin appuser
 
-# Railway injects PORT; default 8080 for local runs
+# /data — mount a Railway Volume here to persist Pyrogram session files.
+# Without this, every container restart = fresh Telegram auth = FloodWait risk.
+# If no Volume is mounted, /data still exists and works (but sessions reset on redeploy).
+RUN mkdir -p /data /tmp && \
+    chown -R appuser:appuser /app /data /tmp && \
+    chmod 755 /data
+
 ENV PORT=8080
+ENV SESSION_DIR=/data
 EXPOSE 8080
 
-# Non-root user for safety
-RUN useradd -r -u 1001 -s /sbin/nologin appuser && \
-    chown -R appuser:appuser /app /tmp
 USER appuser
 
 CMD ["python", "-m", "bot"]
