@@ -24,6 +24,7 @@ import logging
 from typing import Optional
 
 from pyrogram import Client
+from pyrogram.errors import FloodWait
 
 from bot.config import Config
 
@@ -48,15 +49,35 @@ class ClientPool:
                 api_id=api_id,
                 api_hash=api_hash,
                 bot_token=Config.BOT_TOKEN,
-                # Store session files in /tmp — Railway ephemeral disk is fine
-                # because bots re-auth automatically on each restart.
-                workdir="/tmp",
-                # Limit Pyrogram's own connection pool — keeps RAM lean.
-                max_concurrent_transmissions=4,
+                workdir=Config.SESSION_DIR,
+                # Higher value = more parallel Telegram connections per client.
+                # With 2 API apps × 8 transmissions = 16 parallel download streams.
+                max_concurrent_transmissions=8,
             )
-            await client.start()
-            self._clients.append(client)
-            log.info("  ✓ Client %d started (api_id=%s)", idx, api_id)
+            try:
+                await client.start()
+                self._clients.append(client)
+                log.info("  ✓ Client %d started (api_id=%s)", idx, api_id)
+            except FloodWait as fw:
+                log.error(
+                    "  Telegram FloodWait on client %d: must wait %d seconds (%d minutes).\n"
+                    "  Too many auth attempts were made in a short time.\n"
+                    "  STOP the service and wait before restarting.",
+                    idx, fw.value, fw.value // 60
+                )
+                # Stop any clients that did start cleanly
+                for c in self._clients:
+                    try:
+                        await c.stop()
+                    except Exception:
+                        pass
+                raise RuntimeError(
+                    f"Telegram FloodWait: wait {fw.value} seconds ({fw.value // 60} min) "
+                    f"before restarting. SUSPEND the service now."
+                ) from fw
+            except Exception as exc:
+                log.error("  Failed to start client %d: %s", idx, exc)
+                raise
 
         if not self._clients:
             raise RuntimeError("No Telegram clients started — check API_ID / API_HASH.")
