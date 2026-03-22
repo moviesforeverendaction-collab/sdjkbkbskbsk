@@ -2,10 +2,7 @@
 Streaming engine.
 
 Pulls file data from Telegram via Pyrogram's stream_media(),
-and yields it chunk by chunk to the aiohttp response writer.
-
-Accepts any client from ClientPool — the pool handles round-robin
-so download load spreads across both API app buckets automatically.
+pipes it chunk by chunk to the aiohttp response writer.
 """
 
 import asyncio
@@ -30,12 +27,10 @@ async def iter_file(
     """
     Stream a Telegram file as an async generator of bytes.
 
-    Args:
-        client:      Pyrogram bot client (single session).
-        message_id:  ID of the message in the storage channel.
-        channel_id:  ID of the private storage channel.
-        offset:      Byte offset (for range requests / resume support).
-        chunk_size:  Bytes per chunk yielded to the HTTP response.
+    offset is a BYTE offset (from HTTP Range header).
+    Pyrogram's stream_media() takes a chunk-index offset, so we convert:
+      chunk_index = offset // chunk_size
+      skip_bytes  = offset % chunk_size  (partial first chunk)
     """
     try:
         message = await client.get_messages(channel_id, message_id)
@@ -47,30 +42,45 @@ async def iter_file(
         log.warning("Message %s not found in channel", message_id)
         return
 
-    # Pre-read buffer: keeps the HTTP pipe full between Telegram round-trips.
+    # Convert byte offset → chunk index + intra-chunk skip
+    chunk_index = offset // chunk_size
+    skip_bytes  = offset % chunk_size
+
     buffer: asyncio.Queue[Optional[bytes]] = asyncio.Queue(
         maxsize=Config.PREFETCH_CHUNKS
     )
 
     async def _fill_buffer() -> None:
+        first = True
         try:
             while True:
                 try:
                     async for chunk in client.stream_media(
-                        message, offset=offset, chunk_size=chunk_size
+                        message,
+                        offset=chunk_index,
+                        chunk_size=chunk_size,
                     ):
-                        await buffer.put(chunk)
-                    break  # stream finished cleanly
+                        if first and skip_bytes:
+                            # Trim the partial first chunk to honour byte offset
+                            chunk = chunk[skip_bytes:]
+                            first = False
+                        else:
+                            first = False
+                        if chunk:
+                            await buffer.put(chunk)
+                    break
                 except FloodWait as fw:
-                    # Back off exactly as long as Telegram asks, then retry.
-                    log.warning("FloodWait %ss on msg %s — retrying after sleep", fw.value, message_id)
+                    log.warning(
+                        "FloodWait %ss on msg %s — retrying",
+                        fw.value, message_id
+                    )
                     await asyncio.sleep(fw.value)
         except asyncio.CancelledError:
             pass
         except Exception as exc:
-            log.error("Error filling buffer for msg %s: %s", message_id, exc)
+            log.error("Buffer fill error for msg %s: %s", message_id, exc)
         finally:
-            await buffer.put(None)  # sentinel — always signals end
+            await buffer.put(None)  # sentinel
 
     filler = asyncio.create_task(_fill_buffer())
     try:
@@ -98,11 +108,11 @@ def parse_range_header(
         return 0, file_size - 1
 
     try:
-        range_spec = range_header[len("bytes="):]
-        start_str, _, end_str = range_spec.partition("-")
+        spec = range_header[len("bytes="):]
+        start_str, _, end_str = spec.partition("-")
         start = int(start_str) if start_str else 0
-        end = int(end_str) if end_str else file_size - 1
-        end = min(end, file_size - 1)
+        end   = int(end_str)   if end_str   else file_size - 1
+        end   = min(end, file_size - 1)
         start = max(0, start)
         return start, end
     except (ValueError, AttributeError):
