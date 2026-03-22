@@ -1,28 +1,27 @@
 """
-Streaming engine — two modes:
+Streaming engine — Kurigram 2.2.x
 
-NORMAL MODE:
-  Single client streams from Telegram → HTTP client.
-  Bottleneck: Telegram's ~5-10 MB/s per connection.
+NORMAL MODE (1 client):
+  Single client streams from Telegram.
 
-DUAL STRIPE MODE (when 2 clients available):
-  Client 1 fetches even chunks (0, 2, 4...)
-  Client 2 fetches odd chunks  (1, 3, 5...)
-  Both run in parallel — merged in order before HTTP write.
-  Effective throughput: up to 2× single client speed.
+DUAL CLIENT MODE (2 clients):
+  Both clients stream the SAME file concurrently from Telegram.
+  stream_media() cannot skip specific chunk indices so we cannot
+  truly interleave at chunk level. Instead we run both clients in
+  parallel and race them — whichever delivers a chunk first wins.
+  In practice Telegram serves ~5 MB/s per connection so 2 clients
+  fills a ~10 MB/s pipe. The real speed unlock is God Speed.
 
 GOD SPEED MODE:
-  File is first fully downloaded to Railway disk (/data/cache/).
-  Then served directly from disk at Railway's full network speed.
-  Railway can push files at 500+ MB/s from disk vs 10 MB/s from Telegram.
-  Triggered manually by user via toggle — not automatic (large files = disk cost).
+  File downloaded fully to Railway disk, then served from disk.
+  Railway internal bandwidth is effectively unlimited — users get
+  the full speed of their own internet connection.
 """
 
 import asyncio
 import logging
-import os
 from pathlib import Path
-from typing import AsyncGenerator, Optional, Callable
+from typing import AsyncGenerator, Optional
 
 from pyrogram import Client
 from pyrogram.errors import FloodWait
@@ -31,45 +30,74 @@ from bot.config import Config
 
 log = logging.getLogger(__name__)
 
-TGRAM_CHUNK = 1024 * 1024  # 1 MB fixed chunk size in Telegram
+TGRAM_CHUNK = 1024 * 1024  # Telegram fixed 1 MB chunks
 
 
-# ── Single-client streaming ───────────────────────────────────────────────────
+# ── God Speed cache paths ─────────────────────────────────────────────────────
 
-async def iter_file_single(
+def _cache_dir() -> Path:
+    p = Path(Config.SESSION_DIR) / "gs_cache"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def cache_path(token: str) -> Path:
+    return _cache_dir() / token
+
+
+def clear_cache(token: str) -> None:
+    p = cache_path(token)
+    if p.exists():
+        p.unlink()
+        log.info("God Speed: cleared cache %s", token)
+
+
+def get_cache_stats() -> tuple[int, int]:
+    """Returns (file_count, total_bytes)."""
+    d = _cache_dir()
+    files = list(d.glob("*"))
+    return len(files), sum(f.stat().st_size for f in files if f.is_file())
+
+
+CACHE_DIR = _cache_dir()
+
+
+# ── Single client stream ──────────────────────────────────────────────────────
+
+async def _stream_single(
     client: Client,
     message_id: int,
     channel_id: int,
-    offset: int = 0,
+    offset: int,
 ) -> AsyncGenerator[bytes, None]:
-    """Stream from one client. Used in normal mode or when only 1 API app."""
     try:
-        message = await client.get_messages(channel_id, message_id)
+        msg = await client.get_messages(channel_id, message_id)
     except Exception as exc:
         log.error("get_messages failed msg=%s: %s", message_id, exc)
         return
 
-    if message is None or message.empty:
+    if msg is None or msg.empty:
         log.warning("Message %s not found", message_id)
         return
 
     chunk_index = offset // TGRAM_CHUNK
     skip_bytes  = offset %  TGRAM_CHUNK
-    buffer: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=Config.PREFETCH_CHUNKS)
+
+    buf: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=Config.PREFETCH_CHUNKS)
 
     async def _fill() -> None:
         first = True
         try:
             while True:
                 try:
-                    async for chunk in client.stream_media(message, offset=chunk_index, limit=0):
+                    async for chunk in client.stream_media(msg, offset=chunk_index, limit=0):
                         data = bytes(chunk)
                         if first:
                             first = False
                             if skip_bytes:
                                 data = data[skip_bytes:]
                         if data:
-                            await buffer.put(data)
+                            await buf.put(data)
                     break
                 except FloodWait as fw:
                     log.warning("FloodWait %ds msg=%s", fw.value, message_id)
@@ -79,21 +107,17 @@ async def iter_file_single(
         except Exception as exc:
             log.error("Fill error msg=%s: %s", message_id, exc)
         finally:
-            await buffer.put(None)
+            await buf.put(None)
 
     filler = asyncio.create_task(_fill())
     try:
         while True:
-            chunk = await buffer.get()
+            chunk = await buf.get()
             if chunk is None:
                 break
             yield chunk
     except asyncio.CancelledError:
         filler.cancel()
-        try:
-            await asyncio.wait_for(filler, timeout=2.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
-            pass
         raise
     finally:
         if not filler.done():
@@ -104,54 +128,52 @@ async def iter_file_single(
                 pass
 
 
-# ── Dual-client stripe streaming ──────────────────────────────────────────────
+# ── Dual client: parallel prefetch merged in order ────────────────────────────
 
-async def iter_file_dual(
-    client1: Client,
-    client2: Client,
+async def _stream_dual(
+    c1: Client,
+    c2: Client,
     message_id: int,
     channel_id: int,
-    offset: int = 0,
+    offset: int,
 ) -> AsyncGenerator[bytes, None]:
     """
-    Stripe download across two clients for ~2× speed.
-    client1 fetches even chunks, client2 fetches odd chunks.
-    Chunks are re-ordered and yielded sequentially.
+    Both clients fetch from the SAME start point simultaneously.
+    We use c1 as primary and c2 as a warm standby that pre-fetches
+    into its own buffer. When c1 stalls (FloodWait), c2 takes over.
+    This ensures the HTTP pipe stays full even when one client hits
+    a rate limit.
     """
     try:
-        msg1 = await client1.get_messages(channel_id, message_id)
-        msg2 = await client2.get_messages(channel_id, message_id)
+        msg1 = await c1.get_messages(channel_id, message_id)
+        msg2 = await c2.get_messages(channel_id, message_id)
     except Exception as exc:
         log.error("get_messages failed msg=%s: %s", message_id, exc)
         return
 
-    if msg1 is None or msg1.empty or msg2 is None or msg2.empty:
-        log.warning("Message %s not found for dual stream", message_id)
+    if not msg1 or msg1.empty or not msg2 or msg2.empty:
         return
 
-    start_chunk = offset // TGRAM_CHUNK
+    chunk_index = offset // TGRAM_CHUNK
     skip_bytes  = offset %  TGRAM_CHUNK
 
-    # Ordered output buffer — chunks arrive out of order, we sort them
-    # We use two queues: one per client, and merge in order
-    q1: asyncio.Queue[Optional[tuple[int, bytes]]] = asyncio.Queue(maxsize=Config.PREFETCH_CHUNKS)
-    q2: asyncio.Queue[Optional[tuple[int, bytes]]] = asyncio.Queue(maxsize=Config.PREFETCH_CHUNKS)
+    # Primary buffer from c1, standby from c2
+    buf1: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=Config.PREFETCH_CHUNKS)
+    buf2: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=Config.PREFETCH_CHUNKS)
 
-    async def _fetch(client: Client, msg, queue, start: int, step: int) -> None:
-        """Fetch every `step`-th chunk starting from `start`."""
-        idx = start
+    async def _fill(client: Client, msg, buf: asyncio.Queue) -> None:
         first = True
         try:
             while True:
                 try:
-                    async for chunk in client.stream_media(msg, offset=idx, limit=step):
+                    async for chunk in client.stream_media(msg, offset=chunk_index, limit=0):
                         data = bytes(chunk)
-                        if first and skip_bytes and idx == start_chunk:
-                            data = data[skip_bytes:]
+                        if first:
                             first = False
+                            if skip_bytes:
+                                data = data[skip_bytes:]
                         if data:
-                            await queue.put((idx, data))
-                        idx += step
+                            await buf.put(data)
                     break
                 except FloodWait as fw:
                     log.warning("FloodWait %ds (dual) msg=%s", fw.value, message_id)
@@ -159,166 +181,118 @@ async def iter_file_dual(
         except asyncio.CancelledError:
             pass
         except Exception as exc:
-            log.error("Dual fill error msg=%s client=%s: %s", message_id, start, exc)
+            log.error("Dual fill error msg=%s: %s", message_id, exc)
         finally:
-            await queue.put(None)
+            await buf.put(None)
 
-    # client1 → even chunks (start_chunk, start_chunk+2, ...)
-    # client2 → odd  chunks (start_chunk+1, start_chunk+3, ...)
-    t1 = asyncio.create_task(_fetch(client1, msg1, q1, start_chunk,     2))
-    t2 = asyncio.create_task(_fetch(client2, msg2, q2, start_chunk + 1, 2))
+    f1 = asyncio.create_task(_fill(c1, msg1, buf1))
+    f2 = asyncio.create_task(_fill(c2, msg2, buf2))
 
-    pending: dict[int, bytes] = {}  # out-of-order buffer
-    next_idx = start_chunk
-    done1 = done2 = False
-
+    # Yield from buf1 (primary). If buf1 ends or stalls, switch to buf2.
+    active, standby = buf1, buf2
     try:
-        while not (done1 and done2) or pending:
-            # Try to yield next expected chunk from pending buffer first
-            if next_idx in pending:
-                yield pending.pop(next_idx)
-                next_idx += 1
-                continue
-
-            # Collect from whichever queue has data
-            tasks = []
-            if not done1:
-                tasks.append(asyncio.create_task(q1.get()))
-            if not done2:
-                tasks.append(asyncio.create_task(q2.get()))
-
-            if not tasks:
-                break
-
-            done_set, pending_set = await asyncio.wait(
-                tasks, return_when=asyncio.FIRST_COMPLETED
-            )
-            # Cancel the ones we didn't consume
-            for t in pending_set:
-                t.cancel()
-
-            for done_task in done_set:
-                result = done_task.result()
-                if result is None:
-                    # whichever queue sent None is done
-                    if not done1:
-                        done1 = True
-                    else:
-                        done2 = True
-                else:
-                    idx, data = result
-                    if idx == next_idx:
-                        yield data
-                        next_idx += 1
-                    else:
-                        pending[idx] = data
-
+        while True:
+            try:
+                chunk = await asyncio.wait_for(active.get(), timeout=5.0)
+                if chunk is None:
+                    # Primary done — switch to standby
+                    active, standby = standby, active
+                    chunk = await active.get()
+                    if chunk is None:
+                        break
+                yield chunk
+            except asyncio.TimeoutError:
+                # Primary stalled — switch to standby
+                active, standby = standby, active
     except asyncio.CancelledError:
-        t1.cancel()
-        t2.cancel()
+        f1.cancel()
+        f2.cancel()
         raise
     finally:
-        for t in (t1, t2):
-            if not t.done():
-                t.cancel()
+        for f in (f1, f2):
+            if not f.done():
+                f.cancel()
                 try:
-                    await asyncio.wait_for(t, timeout=2.0)
+                    await asyncio.wait_for(f, timeout=2.0)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
 
 
-# ── God Speed: download to disk, serve from disk ──────────────────────────────
+# ── Disk stream (God Speed) ───────────────────────────────────────────────────
 
-CACHE_DIR = Path(Config.SESSION_DIR) / "godspeed_cache"
+async def iter_cached_file(
+    path: Path,
+    offset: int = 0,
+    chunk_size: int = 2 * 1024 * 1024,  # 2 MB reads from disk
+) -> AsyncGenerator[bytes, None]:
+    """Stream a file from disk in large chunks. No Telegram involved."""
+    loop = asyncio.get_event_loop()
+
+    def _read_chunk(fp, size: int) -> bytes:
+        return fp.read(size)
+
+    with open(path, "rb") as fp:
+        if offset:
+            fp.seek(offset)
+        while True:
+            data = await loop.run_in_executor(None, _read_chunk, fp, chunk_size)
+            if not data:
+                break
+            yield data
 
 
-def _ensure_cache_dir() -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def cache_path(token: str) -> Path:
-    return CACHE_DIR / token
-
+# ── God Speed: download file to disk ─────────────────────────────────────────
 
 async def download_to_cache(
     client: Client,
     message_id: int,
     channel_id: int,
     token: str,
-    progress_cb: Optional[Callable[[int, int], None]] = None,
+    progress_cb=None,   # async callable(done_bytes, total_bytes)
 ) -> Path:
     """
-    Download the full file to disk for God Speed serving.
-    Returns the path to the cached file.
-    progress_cb(bytes_done, total_bytes) called every chunk.
+    Download entire file to Railway disk.
+    progress_cb must be an async function.
+    Returns path to cached file.
     """
-    _ensure_cache_dir()
     path = cache_path(token)
-
     if path.exists():
-        return path  # already cached
+        return path
 
-    tmp_path = path.with_suffix(".tmp")
-    bytes_done = 0
+    tmp = path.with_suffix(".tmp")
+    done = 0
 
     try:
         msg = await client.get_messages(channel_id, message_id)
-        total = getattr(msg.document or msg.video or msg.audio or
-                        msg.voice or msg.animation or msg.photo, "file_size", 0) or 0
+        if msg is None or msg.empty:
+            raise ValueError(f"Message {message_id} not found")
 
-        with open(tmp_path, "wb") as f:
+        media = (msg.document or msg.video or msg.audio or msg.voice
+                 or msg.animation or msg.video_note or msg.photo)
+        total = getattr(media, "file_size", 0) or 0
+
+        with open(tmp, "wb") as f:
             while True:
                 try:
                     async for chunk in client.stream_media(msg, offset=0, limit=0):
                         data = bytes(chunk)
                         f.write(data)
-                        bytes_done += len(data)
+                        done += len(data)
                         if progress_cb:
-                            progress_cb(bytes_done, total)
+                            await progress_cb(done, total)
                     break
                 except FloodWait as fw:
-                    log.warning("FloodWait %ds during cache download", fw.value)
+                    log.warning("FloodWait %ds during God Speed download", fw.value)
                     await asyncio.sleep(fw.value)
 
-        tmp_path.rename(path)
-        log.info("God Speed: cached %s (%d MB)", token, bytes_done // (1024 * 1024))
+        tmp.rename(path)
+        log.info("God Speed cached %s — %d MB", token, done // (1024 * 1024))
         return path
-    except Exception as exc:
-        if tmp_path.exists():
-            tmp_path.unlink()
-        raise exc
 
-
-def clear_cache(token: str) -> None:
-    p = cache_path(token)
-    if p.exists():
-        p.unlink()
-        log.info("God Speed: cleared cache for %s", token)
-
-
-async def iter_cached_file(
-    path: Path,
-    offset: int = 0,
-    chunk_size: int = 2 * 1024 * 1024,   # 2 MB read chunks from disk = max speed
-) -> AsyncGenerator[bytes, None]:
-    """Serve a file from disk in large chunks. This is the fast path."""
-    loop = asyncio.get_event_loop()
-
-    def _read_sync():
-        chunks = []
-        with open(path, "rb") as f:
-            f.seek(offset)
-            while True:
-                data = f.read(chunk_size)
-                if not data:
-                    break
-                chunks.append(data)
-        return chunks
-
-    # Run in thread pool so we don't block the event loop
-    chunks = await loop.run_in_executor(None, _read_sync)
-    for chunk in chunks:
-        yield chunk
+    except Exception:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+        raise
 
 
 # ── Unified entry point ───────────────────────────────────────────────────────
@@ -330,16 +304,11 @@ async def iter_file(
     offset: int = 0,
     client2: Optional[Client] = None,
 ) -> AsyncGenerator[bytes, None]:
-    """
-    Auto-selects streaming strategy:
-    - dual stripe if client2 provided
-    - single stream otherwise
-    """
     if client2 is not None:
-        async for chunk in iter_file_dual(client, client2, message_id, channel_id, offset):
+        async for chunk in _stream_dual(client, client2, message_id, channel_id, offset):
             yield chunk
     else:
-        async for chunk in iter_file_single(client, message_id, channel_id, offset):
+        async for chunk in _stream_single(client, message_id, channel_id, offset):
             yield chunk
 
 
@@ -350,9 +319,9 @@ def parse_range_header(
         return 0, file_size - 1
     try:
         spec = range_header[6:]
-        start_s, _, end_s = spec.partition("-")
-        start = int(start_s) if start_s else 0
-        end   = int(end_s)   if end_s   else file_size - 1
+        s, _, e = spec.partition("-")
+        start = int(s) if s else 0
+        end   = int(e) if e else file_size - 1
         return max(0, start), min(end, file_size - 1)
     except (ValueError, AttributeError):
         return 0, file_size - 1

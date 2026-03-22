@@ -1,25 +1,22 @@
 """
-Telegram bot handlers — full UI with inline buttons.
+Telegram bot handlers.
 
-Commands:
-  /start       — welcome + main menu
-  /help        — usage guide
-  /godspeed    — toggle God Speed mode
-  /settings    — user settings panel
-  /delete      — owner: remove a link
-  /stats       — owner: bot stats
-  /cache       — owner: manage god speed cache
+ALL handlers live inside the single register_handlers() function.
+This is required — Pyrogram registers handlers via decorators that
+capture the client reference, so they MUST be defined inside the
+function that receives the client argument.
 
-God Speed mode:
-  When ON  → bot downloads file to Railway disk first, then returns a link
-             that serves at Railway's full network speed (no Telegram bottleneck)
-  When OFF → standard Telegram streaming (~10 MB/s dual client)
+Flow:
+  1. User sends file
+  2. Bot asks expiry via inline keyboard
+  3. User picks expiry
+  4. If God Speed ON  → download to disk, then send link
+     If God Speed OFF → forward to channel, send link immediately
 """
 
 import asyncio
 import logging
 import time
-from pathlib import Path
 
 from pyrogram import Client, filters
 from pyrogram.types import (
@@ -35,8 +32,10 @@ from bot.database import EXPIRY_OPTIONS
 
 log = logging.getLogger(__name__)
 
+# Pending uploads waiting for expiry selection
+# (user_id, msg_id) → (Message, monotonic_timestamp)
 _pending: dict[tuple[int, int], tuple[Message, float]] = {}
-_PENDING_TTL = 600
+_PENDING_TTL = 600  # 10 minutes
 
 
 def _is_owner(uid: int) -> bool:
@@ -45,80 +44,76 @@ def _is_owner(uid: int) -> bool:
 
 def _evict_stale() -> None:
     cutoff = time.monotonic() - _PENDING_TTL
-    for k in [k for k, (_, ts) in _pending.items() if ts < cutoff]:
+    stale = [k for k, (_, ts) in _pending.items() if ts < cutoff]
+    for k in stale:
         _pending.pop(k, None)
 
 
-# ── Keyboard builders ──────────────────────────────────────────────────────────
-
-def _main_menu_kb(god_speed: bool) -> InlineKeyboardMarkup:
-    gs_label = "⚡ God Speed: ON" if god_speed else "🐢 God Speed: OFF"
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(gs_label, callback_data="toggle_godspeed")],
-        [InlineKeyboardButton("📖 How to use", callback_data="show_help"),
-         InlineKeyboardButton("⚙️ Settings", callback_data="show_settings")],
-    ])
+def _fmt_size(b: int) -> str:
+    if b >= 1 << 30: return f"{b/(1<<30):.2f} GB"
+    if b >= 1 << 20: return f"{b/(1<<20):.2f} MB"
+    if b >= 1 << 10: return f"{b/(1<<10):.1f} KB"
+    return f"{b} B"
 
 
-def _expiry_kb(god_speed: bool) -> InlineKeyboardMarkup:
-    labels = {
-        "1h": "1 Hour",  "6h": "6 Hours",
-        "12h": "12 Hours", "1d": "1 Day",
-        "3d": "3 Days",  "7d": "7 Days",
-        "30d": "30 Days", "never": "♾️ Never",
-    }
-    buttons, row = [], []
-    for key, label in labels.items():
-        if key == "never":
-            if row:
-                buttons.append(row)
-            buttons.append([InlineKeyboardButton(label, callback_data=f"exp:{key}")])
-            row = []
-        else:
-            row.append(InlineKeyboardButton(label, callback_data=f"exp:{key}"))
-            if len(row) == 2:
-                buttons.append(row)
-                row = []
-    if row:
-        buttons.append(row)
-    # Mode indicator at bottom
-    mode = "⚡ God Speed ON" if god_speed else "🔵 Standard Mode"
-    buttons.append([InlineKeyboardButton(f"Mode: {mode}", callback_data="noop")])
-    return InlineKeyboardMarkup(buttons)
-
-
-def _settings_kb(god_speed: bool) -> InlineKeyboardMarkup:
-    gs_label = "⚡ God Speed: ON  ✅" if god_speed else "⚡ God Speed: OFF  ❌"
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(gs_label, callback_data="toggle_godspeed")],
-        [InlineKeyboardButton("🔙 Back", callback_data="show_main")],
-    ])
-
-
-def _format_size(size: int) -> str:
-    if size >= 1024 * 1024 * 1024:
-        return f"{size / (1024**3):.2f} GB"
-    if size >= 1024 * 1024:
-        return f"{size / (1024**2):.2f} MB"
-    if size >= 1024:
-        return f"{size / 1024:.1f} KB"
-    return f"{size} B"
-
-
-def _format_expiry(expires_in, expires_at) -> str:
-    if expires_in is None or expires_at is None:
+def _fmt_expiry(expires_in, expires_at) -> str:
+    if not expires_in or not expires_at:
         return "Never expires"
     delta = expires_at - int(time.time())
     if delta <= 0:
         return "Expired"
-    h, rem = divmod(delta, 3600)
-    m = rem // 60
+    h, r = divmod(delta, 3600)
+    m = r // 60
     if h >= 24:
-        return f"Expires in {h // 24}d {h % 24}h"
+        return f"Expires in {h//24}d {h%24}h"
     return f"Expires in {h}h {m}m"
 
 
+def _main_kb(gs: bool) -> InlineKeyboardMarkup:
+    icon = "⚡ God Speed: ON  ✅" if gs else "🔵 God Speed: OFF  ❌"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(icon, callback_data="toggle_gs")],
+        [
+            InlineKeyboardButton("📖 Help", callback_data="show_help"),
+            InlineKeyboardButton("⚙️ Settings", callback_data="show_settings"),
+        ],
+    ])
+
+
+def _expiry_kb(gs: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("1 Hour",   callback_data="exp:1h"),
+            InlineKeyboardButton("6 Hours",  callback_data="exp:6h"),
+        ],
+        [
+            InlineKeyboardButton("12 Hours", callback_data="exp:12h"),
+            InlineKeyboardButton("1 Day",    callback_data="exp:1d"),
+        ],
+        [
+            InlineKeyboardButton("3 Days",   callback_data="exp:3d"),
+            InlineKeyboardButton("7 Days",   callback_data="exp:7d"),
+        ],
+        [InlineKeyboardButton("30 Days",     callback_data="exp:30d")],
+        [InlineKeyboardButton("♾️ Never",   callback_data="exp:never")],
+        [InlineKeyboardButton(
+            f"Mode: {'⚡ God Speed' if gs else '🔵 Standard'}",
+            callback_data="toggle_gs_expiry"
+        )],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _settings_kb(gs: bool) -> InlineKeyboardMarkup:
+    icon = "⚡ God Speed: ON  ✅" if gs else "⚡ God Speed: OFF  ❌"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(icon, callback_data="toggle_gs")],
+        [InlineKeyboardButton("🔙 Back", callback_data="show_main")],
+    ])
+
+
 def register_handlers(client: Client) -> None:
+    """Register ALL bot handlers. Must be called once after client.start()."""
 
     # ── /start ────────────────────────────────────────────────────────────────
     @client.on_message(filters.command("start") & filters.private)
@@ -126,17 +121,35 @@ def register_handlers(client: Client) -> None:
         uid = msg.from_user.id
         name = msg.from_user.first_name or "there"
         gs = await database.is_god_speed_enabled(uid)
-
+        mode = "⚡ **God Speed ON**" if gs else "🔵 **Standard Mode**"
         await msg.reply_text(
             f"👋 **Hey {name}!**\n\n"
-            "Send me any file and I'll give you a blazing fast download link.\n\n"
+            "Send me any file — I'll give you a blazing fast download link.\n\n"
+            f"Current mode: {mode}\n\n"
+            "**⚡ God Speed** — pre-downloads to Railway, serves at full bandwidth\n"
+            "**🔵 Standard** — streams directly from Telegram (~10-20 MB/s)",
+            reply_markup=_main_kb(gs),
+        )
+
+    # ── /help ─────────────────────────────────────────────────────────────────
+    @client.on_message(filters.command("help") & filters.private)
+    async def cmd_help(_, msg: Message) -> None:
+        await msg.reply_text(
+            "📖 **How to use**\n\n"
+            "1. Send any file (video, doc, audio, photo)\n"
+            "2. Choose how long the link lasts\n"
+            "3. Share the link — anyone can download, no login needed\n\n"
             "**⚡ God Speed Mode**\n"
-            "Toggle this ON to download the file to Railway's servers first. "
-            "Then your link serves at Railway's full speed — no Telegram bottleneck.\n\n"
+            "Bot downloads your file to Railway first, then serves it at "
+            "Railway's full speed. Best for large files.\n\n"
             "**🔵 Standard Mode**\n"
-            "Dual-client streaming directly from Telegram (~10-20 MB/s).\n\n"
-            f"Current mode: {'⚡ **God Speed ON**' if gs else '🔵 **Standard**'}",
-            reply_markup=_main_menu_kb(gs),
+            "Dual-client Telegram streaming. Fast but capped by Telegram.\n\n"
+            "**Commands**\n"
+            "`/godspeed` — toggle God Speed\n"
+            "`/settings` — settings panel\n"
+            "`/delete <token>` — delete a link (owners)\n"
+            "`/stats` — bot status (owners)\n"
+            "`/cache` — God Speed cache info (owners)"
         )
 
     # ── /godspeed ─────────────────────────────────────────────────────────────
@@ -149,12 +162,12 @@ def register_handlers(client: Client) -> None:
         icon = "⚡" if new_gs else "🔵"
         status = "ON" if new_gs else "OFF"
         note = (
-            "\n\n_Files will be pre-downloaded to Railway for maximum speed._"
+            "_Files will be pre-cached to Railway disk before link is sent._"
             if new_gs else
-            "\n\n_Files will stream directly from Telegram (dual-client mode)._"
+            "_Files will stream directly from Telegram (dual-client)._"
         )
         await msg.reply_text(
-            f"{icon} **God Speed {status}**{note}",
+            f"{icon} **God Speed {status}**\n\n{note}",
             reply_markup=_settings_kb(new_gs),
         )
 
@@ -165,113 +178,162 @@ def register_handlers(client: Client) -> None:
         gs = await database.is_god_speed_enabled(uid)
         await msg.reply_text(
             "⚙️ **Settings**\n\n"
-            f"**God Speed:** {'⚡ ON' if gs else '❌ OFF'}\n"
-            "_Toggle to pre-download files to Railway for max speed._",
+            f"God Speed: {'⚡ ON' if gs else '❌ OFF'}",
             reply_markup=_settings_kb(gs),
         )
 
-    # ── /help ─────────────────────────────────────────────────────────────────
-    @client.on_message(filters.command("help") & filters.private)
-    async def cmd_help(_, msg: Message) -> None:
+    # ── /delete (owner) ───────────────────────────────────────────────────────
+    @client.on_message(filters.command("delete") & filters.private)
+    async def cmd_delete(_, msg: Message) -> None:
+        if not _is_owner(msg.from_user.id):
+            await msg.reply_text("⛔ Owners only.")
+            return
+        parts = msg.text.split(maxsplit=1)
+        if len(parts) < 2:
+            await msg.reply_text("Usage: `/delete <token>`")
+            return
+        token = parts[1].strip()
+        deleted = await database.delete_file(token)
+        await cache.cache_delete(token)
+        from bot.stream import clear_cache
+        clear_cache(token)
+        await msg.reply_text(f"{'✅ Deleted' if deleted else '❌ Not found'}: `{token}`")
+
+    # ── /stats (owner) ────────────────────────────────────────────────────────
+    @client.on_message(filters.command("stats") & filters.private)
+    async def cmd_stats(_, msg: Message) -> None:
+        if not _is_owner(msg.from_user.id):
+            await msg.reply_text("⛔ Owners only.")
+            return
+        db_ok = await database.ping()
+        from bot.stream import get_cache_stats
+        n_files, total_bytes = get_cache_stats()
         await msg.reply_text(
-            "📖 **How to use**\n\n"
-            "1. Send any file (video, doc, audio, photo)\n"
-            "2. Pick how long the link should last\n"
-            "3. Share the link — anyone downloads, no login needed\n\n"
-            "**⚡ God Speed Mode** (recommended for large files)\n"
-            "The bot downloads your file to Railway's disk first, then "
-            "serves it at Railway's full bandwidth. Much faster for the "
-            "end user. Use `/godspeed` to toggle.\n\n"
-            "**🔵 Standard Mode**\n"
-            "Dual-client direct Telegram streaming. Faster setup but "
-            "download speed capped by Telegram's rate limits.\n\n"
-            "**Commands**\n"
-            "`/godspeed` — toggle God Speed mode\n"
-            "`/settings` — settings panel\n"
-            "`/delete <token>` — delete a link (owners)\n"
-            "`/stats` — bot status (owners)\n"
-            "`/cache` — cache stats (owners)"
+            "📊 **Bot Stats**\n\n"
+            f"DB: {'✅ connected' if db_ok else '❌ DOWN'}\n"
+            f"Base URL: `{Config.BASE_URL}`\n"
+            f"API apps: `{len(Config.api_pairs())}`\n"
+            f"Chunk size: `{Config.CHUNK_SIZE // 1024} KB`\n"
+            f"Prefetch: `{Config.PREFETCH_CHUNKS} chunks`\n\n"
+            f"⚡ **God Speed Cache**\n"
+            f"Files: `{n_files}`\n"
+            f"Size: `{_fmt_size(total_bytes)}`"
         )
 
-    # ── Callback: toggle god speed ────────────────────────────────────────────
-    @client.on_callback_query(filters.regex("^toggle_godspeed$"))
+    # ── /cache (owner) ────────────────────────────────────────────────────────
+    @client.on_message(filters.command("cache") & filters.private)
+    async def cmd_cache(_, msg: Message) -> None:
+        if not _is_owner(msg.from_user.id):
+            await msg.reply_text("⛔ Owners only.")
+            return
+        from bot.stream import get_cache_stats
+        n_files, total_bytes = get_cache_stats()
+        await msg.reply_text(
+            f"⚡ **God Speed Cache**\n\n"
+            f"Files: `{n_files}`\n"
+            f"Size: `{_fmt_size(total_bytes)}`",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗑 Clear All", callback_data="clear_cache")
+            ]])
+        )
+
+    # ── Callbacks ─────────────────────────────────────────────────────────────
+
+    @client.on_callback_query(filters.regex("^toggle_gs$"))
     async def cb_toggle_gs(_, cb: CallbackQuery) -> None:
         uid = cb.from_user.id
         gs = await database.is_god_speed_enabled(uid)
         new_gs = not gs
         await database.set_god_speed(uid, new_gs)
         icon = "⚡" if new_gs else "🔵"
-        status = "ON" if new_gs else "OFF"
-        await cb.answer(f"{icon} God Speed {status}", show_alert=False)
-        # Refresh the keyboard in context
+        await cb.answer(f"{icon} God Speed {'ON' if new_gs else 'OFF'}")
         try:
-            if cb.message.text and "Settings" in cb.message.text:
+            # Try to refresh the keyboard in-place
+            text = cb.message.text or ""
+            if "Settings" in text:
                 await cb.message.edit_reply_markup(_settings_kb(new_gs))
             else:
-                await cb.message.edit_reply_markup(_main_menu_kb(new_gs))
+                await cb.message.edit_reply_markup(_main_kb(new_gs))
+        except Exception:
+            pass
+
+    @client.on_callback_query(filters.regex("^toggle_gs_expiry$"))
+    async def cb_toggle_gs_expiry(_, cb: CallbackQuery) -> None:
+        uid = cb.from_user.id
+        gs = await database.is_god_speed_enabled(uid)
+        new_gs = not gs
+        await database.set_god_speed(uid, new_gs)
+        icon = "⚡" if new_gs else "🔵"
+        await cb.answer(f"{icon} God Speed {'ON' if new_gs else 'OFF'}")
+        try:
+            await cb.message.edit_reply_markup(_expiry_kb(new_gs))
         except Exception:
             pass
 
     @client.on_callback_query(filters.regex("^show_help$"))
-    async def cb_help(_, cb: CallbackQuery) -> None:
+    async def cb_show_help(_, cb: CallbackQuery) -> None:
         await cb.answer()
         await cb.message.reply_text(
-            "Send any file → pick expiry → get download link.\n"
-            "Use /godspeed for max speed mode."
+            "Send any file → pick expiry → get link.\n"
+            "Use /godspeed to toggle max speed mode."
         )
 
     @client.on_callback_query(filters.regex("^show_settings$"))
-    async def cb_settings(_, cb: CallbackQuery) -> None:
+    async def cb_show_settings(_, cb: CallbackQuery) -> None:
         uid = cb.from_user.id
         gs = await database.is_god_speed_enabled(uid)
         await cb.answer()
         await cb.message.edit_text(
             "⚙️ **Settings**\n\n"
-            f"**God Speed:** {'⚡ ON' if gs else '❌ OFF'}\n"
-            "_Toggle to pre-download files to Railway for max speed._",
+            f"God Speed: {'⚡ ON' if gs else '❌ OFF'}",
             reply_markup=_settings_kb(gs),
         )
 
     @client.on_callback_query(filters.regex("^show_main$"))
-    async def cb_main(_, cb: CallbackQuery) -> None:
+    async def cb_show_main(_, cb: CallbackQuery) -> None:
         uid = cb.from_user.id
         gs = await database.is_god_speed_enabled(uid)
         await cb.answer()
         await cb.message.edit_text(
             "Send me any file to get a download link.",
-            reply_markup=_main_menu_kb(gs),
+            reply_markup=_main_kb(gs),
         )
 
-    @client.on_callback_query(filters.regex("^noop$"))
-    async def cb_noop(_, cb: CallbackQuery) -> None:
-        await cb.answer()
+    @client.on_callback_query(filters.regex("^clear_cache$"))
+    async def cb_clear_cache(_, cb: CallbackQuery) -> None:
+        if not _is_owner(cb.from_user.id):
+            await cb.answer("Owners only.", show_alert=True)
+            return
+        from bot.stream import _cache_dir
+        cleared = 0
+        d = _cache_dir()
+        for f in d.glob("*"):
+            if f.is_file():
+                f.unlink()
+                cleared += 1
+        await cb.answer(f"Cleared {cleared} cached files.", show_alert=True)
+        await cb.message.edit_text(f"✅ Cleared {cleared} cached files from God Speed cache.")
 
     # ── File received → ask expiry ────────────────────────────────────────────
+
     @client.on_message(filters.private & filters.media)
     async def handle_media(_, msg: Message) -> None:
         uid = msg.from_user.id
-
         if Config.OWNER_ONLY_UPLOAD and not _is_owner(uid):
             await msg.reply_text("⛔ Only the bot owner can upload files.")
             return
-
         _evict_stale()
         _pending[(uid, msg.id)] = (msg, time.monotonic())
-
         gs = await database.is_god_speed_enabled(uid)
-        mode_text = (
-            "⚡ **God Speed ON** — file will be pre-downloaded to Railway for max speed."
-            if gs else
-            "🔵 **Standard Mode** — dual-client Telegram streaming."
-        )
-
+        mode = "⚡ God Speed — will pre-cache to Railway" if gs else "🔵 Standard — dual Telegram stream"
         await msg.reply_text(
-            f"📁 Got your file!\n\n{mode_text}\n\n"
-            "⏱ **How long should the download link last?**",
+            f"📁 **File received!**\n\nMode: {mode}\n\n"
+            "⏱ **How long should the link last?**",
             reply_markup=_expiry_kb(gs),
         )
 
-    # ── Expiry picked → process ───────────────────────────────────────────────
+    # ── Expiry picked → generate link ─────────────────────────────────────────
+
     @client.on_callback_query(filters.regex(r"^exp:(.+)$"))
     async def handle_expiry(_, cb: CallbackQuery) -> None:
         uid = cb.from_user.id
@@ -291,14 +353,14 @@ def register_handlers(client: Client) -> None:
                 break
 
         if pending_key is None:
-            await cb.answer("Session expired — resend your file.", show_alert=True)
+            await cb.answer("Session expired — please resend your file.", show_alert=True)
             return
 
         file_msg, _ = _pending.pop(pending_key)
         gs = await database.is_god_speed_enabled(uid)
 
         await cb.answer("Processing...")
-        status_msg = await cb.message.edit_text("⏳ Forwarding file to storage...")
+        status = await cb.message.edit_text("⏳ Forwarding to storage...")
 
         try:
             forwarded = await file_msg.forward(Config.CHANNEL_ID)
@@ -307,6 +369,10 @@ def register_handlers(client: Client) -> None:
                 or forwarded.voice or forwarded.video_note or forwarded.animation
                 or forwarded.photo or forwarded.sticker
             )
+
+            if fwd_media is None:
+                await status.edit_text("❌ Could not read file from Telegram. Try again.")
+                return
 
             file_id        = fwd_media.file_id
             file_unique_id = fwd_media.file_unique_id
@@ -326,53 +392,52 @@ def register_handlers(client: Client) -> None:
             )
 
             expiry_label = {
-                "1h": "1 Hour",  "6h": "6 Hours", "12h": "12 Hours",
-                "1d": "1 Day",   "3d": "3 Days",   "7d": "7 Days",
+                "1h": "1 Hour",   "6h": "6 Hours",  "12h": "12 Hours",
+                "1d": "1 Day",    "3d": "3 Days",    "7d":  "7 Days",
                 "30d": "30 Days", "never": "Never",
             }.get(expiry_key, expiry_key)
 
             doc = await database.get_file(token)
-            expiry_str = _format_expiry(doc.get("expires_in") if doc else expires_in,
-                                         doc.get("expires_at") if doc else None)
+            expiry_str = _fmt_expiry(
+                doc.get("expires_in") if doc else expires_in,
+                doc.get("expires_at") if doc else None,
+            )
 
             link = f"{Config.BASE_URL}/dl/{token}"
 
             if gs:
-                # God Speed: pre-download to Railway disk
-                await status_msg.edit_text(
-                    f"⚡ **God Speed: Downloading to Railway...**\n\n"
+                # God Speed: show status, kick off background download
+                await status.edit_text(
+                    f"⚡ **God Speed: Caching to Railway...**\n\n"
                     f"📄 `{file_name}`\n"
-                    f"📦 {_format_size(file_size)}\n\n"
-                    "_This may take a moment. The link will be ready once downloaded._"
+                    f"📦 {_fmt_size(file_size)}\n\n"
+                    "_Downloading to Railway disk. Link ready when done._"
                 )
-                # Kick off background cache download
-                asyncio.create_task(
-                    _god_speed_download(
-                        client, forwarded.id, token, file_name,
-                        file_size, expiry_label, expiry_str, link, status_msg
-                    )
-                )
+                asyncio.create_task(_god_speed_task(
+                    client, forwarded.id, token, file_name,
+                    file_size, expiry_label, expiry_str, link, status
+                ))
             else:
-                # Standard mode: link ready immediately
-                await status_msg.edit_text(
+                # Standard: link is ready now
+                await status.edit_text(
                     f"✅ **Link Ready!**\n\n"
                     f"📄 `{file_name}`\n"
-                    f"📦 {_format_size(file_size)}\n"
-                    f"⏱ {expiry_label}  ({expiry_str})\n"
-                    f"🔵 Standard streaming mode\n\n"
+                    f"📦 {_fmt_size(file_size)}\n"
+                    f"⏱ {expiry_label} ({expiry_str})\n"
+                    f"🔵 Standard streaming\n\n"
                     f"🔗 {link}\n\n"
                     "_Direct download — no account needed_",
                     reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("⚡ Switch to God Speed", callback_data="toggle_godspeed")
+                        InlineKeyboardButton("⚡ Try God Speed next time", callback_data="toggle_gs")
                     ]])
                 )
 
         except Exception as exc:
-            log.error("Error processing file for user %s: %s", uid, exc)
-            await status_msg.edit_text("❌ Something went wrong. Please try again.")
+            log.error("File processing error user=%s: %s", uid, exc)
+            await status.edit_text("❌ Something went wrong. Please try again.")
 
 
-async def _god_speed_download(
+async def _god_speed_task(
     client: Client,
     message_id: int,
     token: str,
@@ -383,28 +448,29 @@ async def _god_speed_download(
     link: str,
     status_msg,
 ) -> None:
-    """Background task: download file to Railway disk, update message when done."""
+    """Background task: download to disk, then update the message with the link."""
     from bot.stream import download_to_cache
 
-    last_update = time.time()
     start_time = time.time()
+    last_edit  = [0.0]   # use list so inner async func can mutate it
 
-    def _progress(done: int, total: int) -> None:
-        nonlocal last_update
+    async def _progress(done: int, total: int) -> None:
         now = time.time()
-        if now - last_update < 3:  # update every 3s
+        if now - last_edit[0] < 3.0:
             return
-        last_update = now
-        if total > 0:
-            pct = done / total * 100
-            speed = done / (now - start_time) / (1024 * 1024)
-            asyncio.create_task(status_msg.edit_text(
+        last_edit[0] = now
+        pct   = (done / total * 100) if total > 0 else 0
+        speed = done / max(now - start_time, 0.001) / (1024 * 1024)
+        try:
+            await status_msg.edit_text(
                 f"⚡ **God Speed: Caching...**\n\n"
                 f"📄 `{file_name}`\n"
-                f"📊 {pct:.1f}%  —  {_format_size(done)} / {_format_size(total)}\n"
-                f"🚀 {speed:.1f} MB/s\n\n"
+                f"📊 {pct:.1f}%  —  {_fmt_size(done)} / {_fmt_size(total)}\n"
+                f"🚀 {speed:.1f} MB/s (Railway download)\n\n"
                 "_Almost ready..._"
-            ))
+            )
+        except Exception:
+            pass  # edit might fail if message was deleted
 
     try:
         await download_to_cache(
@@ -414,109 +480,32 @@ async def _god_speed_download(
             token=token,
             progress_cb=_progress,
         )
-
         await database.mark_god_speed_ready(token)
 
         elapsed = time.time() - start_time
+        speed   = file_size / max(elapsed, 0.001) / (1024 * 1024)
+
         await status_msg.edit_text(
             f"⚡ **God Speed Ready!**\n\n"
             f"📄 `{file_name}`\n"
-            f"📦 {_format_size(file_size)}\n"
-            f"⏱ {expiry_label}  ({expiry_str})\n"
-            f"⚡ Cached in {elapsed:.1f}s — serving at Railway full speed\n\n"
+            f"📦 {_fmt_size(file_size)}\n"
+            f"⏱ {expiry_label} ({expiry_str})\n"
+            f"🚀 Cached in {elapsed:.1f}s at {speed:.1f} MB/s\n\n"
             f"🔗 {link}\n\n"
-            "_Direct download at maximum speed — no account needed_",
+            "_Serving at Railway full speed — no account needed_"
         )
+
     except Exception as exc:
-        log.error("God Speed cache failed for %s: %s", token, exc)
-        await status_msg.edit_text(
-            f"⚠️ **God Speed failed — falling back to standard link**\n\n"
-            f"📄 `{file_name}`\n"
-            f"📦 {_format_size(file_size)}\n"
-            f"⏱ {expiry_label}  ({expiry_str})\n\n"
-            f"🔗 {link}\n\n"
-            "_Standard streaming mode_"
-        )
-
-
-# ── Owner commands ─────────────────────────────────────────────────────────────
-
-def _register_owner_commands(client: Client) -> None:
-
-    @client.on_message(filters.command("delete") & filters.private)
-    async def cmd_delete(_, msg: Message) -> None:
-        if not _is_owner(msg.from_user.id):
-            await msg.reply_text("⛔ Owners only.")
-            return
-        parts = msg.text.split(maxsplit=1)
-        if len(parts) < 2:
-            await msg.reply_text("Usage: `/delete <token>`")
-            return
-        token = parts[1].strip()
-        deleted = await database.delete_file(token)
-        await cache.cache_delete(token)
-        from bot.stream import clear_cache
-        clear_cache(token)
-        await msg.reply_text(f"{'✅ Deleted' if deleted else '❌ Not found'}: `{token}`")
-
-    @client.on_message(filters.command("stats") & filters.private)
-    async def cmd_stats(_, msg: Message) -> None:
-        if not _is_owner(msg.from_user.id):
-            await msg.reply_text("⛔ Owners only.")
-            return
-        db_ok = await database.ping()
-        from bot.stream import CACHE_DIR
-        cache_files = len(list(CACHE_DIR.glob("*"))) if CACHE_DIR.exists() else 0
-        cache_size  = sum(f.stat().st_size for f in CACHE_DIR.glob("*") if f.is_file()) if CACHE_DIR.exists() else 0
-        await msg.reply_text(
-            "📊 **Bot Stats**\n\n"
-            f"DB: {'✅' if db_ok else '❌'}\n"
-            f"Base URL: `{Config.BASE_URL}`\n"
-            f"API apps: `{len(Config.api_pairs())}`\n"
-            f"Chunk size: `{Config.CHUNK_SIZE // 1024} KB`\n"
-            f"Prefetch: `{Config.PREFETCH_CHUNKS} chunks`\n\n"
-            f"⚡ **God Speed Cache**\n"
-            f"Files cached: `{cache_files}`\n"
-            f"Cache size: `{_format_size(cache_size)}`"
-        )
-
-    @client.on_message(filters.command("cache") & filters.private)
-    async def cmd_cache(_, msg: Message) -> None:
-        if not _is_owner(msg.from_user.id):
-            await msg.reply_text("⛔ Owners only.")
-            return
-        from bot.stream import CACHE_DIR
-        if not CACHE_DIR.exists():
-            await msg.reply_text("No God Speed cache directory found.")
-            return
-        files = list(CACHE_DIR.glob("*"))
-        total_size = sum(f.stat().st_size for f in files if f.is_file())
-        await msg.reply_text(
-            f"⚡ **God Speed Cache**\n\n"
-            f"Cached files: `{len(files)}`\n"
-            f"Total size: `{_format_size(total_size)}`\n\n"
-            "Use `/clearcache` to wipe all cached files.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🗑 Clear All Cache", callback_data="owner_clear_cache")
-            ]])
-        )
-
-    @client.on_callback_query(filters.regex("^owner_clear_cache$"))
-    async def cb_clear_cache(_, cb: CallbackQuery) -> None:
-        if not _is_owner(cb.from_user.id):
-            await cb.answer("Owners only.", show_alert=True)
-            return
-        from bot.stream import CACHE_DIR
-        cleared = 0
-        if CACHE_DIR.exists():
-            for f in CACHE_DIR.glob("*"):
-                if f.is_file():
-                    f.unlink()
-                    cleared += 1
-        await cb.answer(f"Cleared {cleared} files.", show_alert=True)
-        await cb.message.edit_text(f"✅ Cleared {cleared} cached files.")
-
-
-def register_handlers(client: Client) -> None:
-    # All handlers registered above via decorators when this module loads
-    _register_owner_commands(client)
+        log.error("God Speed task failed token=%s: %s", token, exc)
+        # Fall back to standard link
+        try:
+            await status_msg.edit_text(
+                f"⚠️ **God Speed failed — standard link ready**\n\n"
+                f"📄 `{file_name}`\n"
+                f"📦 {_fmt_size(file_size)}\n"
+                f"⏱ {expiry_label} ({expiry_str})\n\n"
+                f"🔗 {link}\n\n"
+                "_Standard streaming mode_"
+            )
+        except Exception:
+            pass
