@@ -55,6 +55,21 @@ async def main() -> None:
     pool = ClientPool()
     await pool.start()
 
+    # Force Pyrogram to resolve and cache the storage channel peer.
+    # Without this, the first forward() call fails with "Peer id invalid"
+    # because Pyrogram hasn't seen this channel in the current session yet.
+    try:
+        chat = await pool.primary().get_chat(Config.CHANNEL_ID)
+        log.info("  Storage channel: %s (id=%s)", chat.title, chat.id)
+    except Exception as exc:
+        log.error(
+            "  Could not resolve storage channel %s: %s\n"
+            "  Make sure the bot is an ADMIN of that channel.",
+            Config.CHANNEL_ID, exc
+        )
+        await pool.stop()
+        return
+
     # Register all bot handlers on the primary client
     register_handlers(pool.primary())
 
