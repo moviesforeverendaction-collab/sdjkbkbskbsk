@@ -29,15 +29,15 @@ class Config:
         return pairs
 
     # The private channel where files are forwarded for storage.
-    # Use a channel you OWN. Get its ID via @userinfobot (negative int).
-    CHANNEL_ID: int = int(os.environ.get("CHANNEL_ID", "0") or "0")
+    # Must be the full ID including -100 prefix, e.g. -1003144372708
+    # Get it by forwarding a message from your channel to @userinfobot
+    CHANNEL_ID: int = int(os.environ.get("CHANNEL_ID", "0").strip() or "0")
 
     # Bot owner user IDs (comma-separated), e.g. "123456789,987654321"
-    # Default empty — "0" would accidentally match Telegram user ID 0.
     OWNER_IDS: list[int] = [
         int(x.strip())
         for x in os.environ.get("OWNER_IDS", "").split(",")
-        if x.strip().isdigit() and int(x.strip()) > 0
+        if x.strip().lstrip("-").isdigit() and int(x.strip()) > 0
     ]
 
     # ── Server ────────────────────────────────────────────────────
