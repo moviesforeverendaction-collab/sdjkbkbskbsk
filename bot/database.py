@@ -3,13 +3,10 @@ import time
 from typing import Optional
 
 from motor.motor_asyncio import AsyncIOMotorClient
-
 from bot.config import Config
-
 
 _client: Optional[AsyncIOMotorClient] = None
 
-# Expiry options shown to users (label -> seconds, None = never)
 EXPIRY_OPTIONS: dict[str, Optional[int]] = {
     "1h":    3600,
     "6h":    21600,
@@ -38,31 +35,18 @@ async def ping() -> bool:
 
 
 async def ensure_indexes() -> None:
-    """
-    Create all required indexes once at startup.
-
-    The TTL index on `expires_at` makes MongoDB auto-delete expired
-    documents — no cron job needed. MongoDB checks every 60 seconds.
-    Documents with expires_at=None are NOT deleted (null is ignored by TTL).
-    """
     col = _db()["files"]
     await col.create_index("token", unique=True, background=True)
     await col.create_index("file_unique_id", background=True)
     await col.create_index("uploader_id", background=True)
+    await col.create_index("expires_at", expireAfterSeconds=0, background=True, sparse=True)
 
-    # TTL index: delete document when current time passes expires_at.
-    # expireAfterSeconds=0 means "delete exactly at expires_at".
-    # Docs where expires_at is null or missing are skipped automatically.
-    await col.create_index(
-        "expires_at",
-        expireAfterSeconds=0,
-        background=True,
-        sparse=True,    # sparse=True skips documents where field is null/missing
-    )
+    # User settings collection
+    ucol = _db()["users"]
+    await ucol.create_index("user_id", unique=True, background=True)
 
 
 def _make_token(length: int = 24) -> str:
-    """Cryptographically random URL-safe token."""
     return secrets.token_urlsafe(length)
 
 
@@ -74,32 +58,19 @@ async def save_file(
     mime_type: str,
     message_id: int,
     uploader_id: int,
-    expires_in: Optional[int],   # seconds from now, or None = never
+    expires_in: Optional[int],
 ) -> str:
-    """
-    Store file metadata. Returns the download token.
-
-    expires_in=None  -> link never expires
-    expires_in=3600  -> link dies after 1 hour
-
-    Dedup only applies for "never" links with the same file_unique_id.
-    Timed links always get a fresh token so the expiry is exactly as chosen.
-    """
     col = _db()["files"]
-
     now = int(time.time())
-    expires_at: Optional[int] = (now + expires_in) if expires_in else None
+    expires_at = (now + expires_in) if expires_in else None
 
-    # Dedup only for never-expiring links
     if expires_at is None:
-        existing = await col.find_one(
-            {"file_unique_id": file_unique_id, "expires_at": None}
-        )
+        existing = await col.find_one({"file_unique_id": file_unique_id, "expires_at": None})
         if existing:
             return existing["token"]
 
     token = _make_token()
-    doc = {
+    await col.insert_one({
         "token":          token,
         "file_id":        file_id,
         "file_unique_id": file_unique_id,
@@ -109,35 +80,30 @@ async def save_file(
         "message_id":     message_id,
         "uploader_id":    uploader_id,
         "created_at":     now,
-        "expires_in":     expires_in,    # stored for display
-        "expires_at":     expires_at,    # None or unix timestamp
+        "expires_in":     expires_in,
+        "expires_at":     expires_at,
         "downloads":      0,
-    }
-    await col.insert_one(doc)
+        "god_speed_ready": False,
+    })
     return token
 
 
 async def get_file(token: str) -> Optional[dict]:
-    """
-    Fetch file metadata by token.
-    Returns None if not found OR if the link has expired.
-    Double-checks expiry here because MongoDB TTL has up to 60s lag.
-    """
     doc = await _db()["files"].find_one({"token": token}, {"_id": 0})
     if doc is None:
         return None
-
     expires_at = doc.get("expires_at")
     if expires_at and int(time.time()) > expires_at:
         return None
-
     return doc
 
 
+async def mark_god_speed_ready(token: str) -> None:
+    await _db()["files"].update_one({"token": token}, {"$set": {"god_speed_ready": True}})
+
+
 async def increment_downloads(token: str) -> None:
-    await _db()["files"].update_one(
-        {"token": token}, {"$inc": {"downloads": 1}}
-    )
+    await _db()["files"].update_one({"token": token}, {"$inc": {"downloads": 1}})
 
 
 async def delete_file(token: str) -> bool:
@@ -146,17 +112,32 @@ async def delete_file(token: str) -> bool:
 
 
 async def delete_expired_files() -> int:
-    """
-    Manual sweep for any expired docs MongoDB TTL hasn't cleaned yet.
-    Belt-and-suspenders — run this hourly.
-    Returns count of deleted docs.
-    """
     now = int(time.time())
-    result = await _db()["files"].delete_many(
-        {"expires_at": {"$lte": now}}
-    )
+    result = await _db()["files"].delete_many({"expires_at": {"$lte": now}})
     return result.deleted_count
 
 
 async def user_file_count(uploader_id: int) -> int:
     return await _db()["files"].count_documents({"uploader_id": uploader_id})
+
+
+# ── User settings ─────────────────────────────────────────────────────────────
+
+async def get_user_settings(user_id: int) -> dict:
+    doc = await _db()["users"].find_one({"user_id": user_id}, {"_id": 0})
+    if doc is None:
+        return {"user_id": user_id, "god_speed": False}
+    return doc
+
+
+async def set_god_speed(user_id: int, enabled: bool) -> None:
+    await _db()["users"].update_one(
+        {"user_id": user_id},
+        {"$set": {"god_speed": enabled}},
+        upsert=True,
+    )
+
+
+async def is_god_speed_enabled(user_id: int) -> bool:
+    settings = await get_user_settings(user_id)
+    return settings.get("god_speed", False)

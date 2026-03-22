@@ -3,8 +3,9 @@ builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-restartPolicyType = "on_failure"
-restartPolicyMaxRetries = 5
+# Never auto-restart — a FloodWait crash loop makes the ban much worse.
+# Railway will still restart on deploy; this only affects crash restarts.
+restartPolicyType = "never"
 
 [environments.production]
 healthcheckPath = "/health"
