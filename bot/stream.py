@@ -1,8 +1,11 @@
 """
-Streaming engine.
+Streaming engine using Kurigram (Pyrogram fork).
 
-Pulls file data from Telegram via Pyrogram's stream_media(),
-pipes it chunk by chunk to the aiohttp response writer.
+stream_media() parameters:
+  offset (int) — chunk index to start from (NOT byte offset)
+  limit  (int) — number of chunks to stream (0 = all)
+
+We convert the HTTP Range byte offset to chunk index + intra-chunk skip.
 """
 
 import asyncio
@@ -16,6 +19,10 @@ from bot.config import Config
 
 log = logging.getLogger(__name__)
 
+# Kurigram/Pyrogram internal chunk size is always 1 MB (1024 * 1024)
+# regardless of what we pass. We use this for offset math.
+TGRAM_CHUNK_SIZE = 1024 * 1024
+
 
 async def iter_file(
     client: Client,
@@ -27,10 +34,8 @@ async def iter_file(
     """
     Stream a Telegram file as an async generator of bytes.
 
-    offset is a BYTE offset (from HTTP Range header).
-    Pyrogram's stream_media() takes a chunk-index offset, so we convert:
-      chunk_index = offset // chunk_size
-      skip_bytes  = offset % chunk_size  (partial first chunk)
+    offset = byte offset from HTTP Range header.
+    Internally converts to chunk index for stream_media().
     """
     try:
         message = await client.get_messages(channel_id, message_id)
@@ -42,33 +47,32 @@ async def iter_file(
         log.warning("Message %s not found in channel", message_id)
         return
 
-    # Convert byte offset → chunk index + intra-chunk skip
-    chunk_index = offset // chunk_size
-    skip_bytes  = offset % chunk_size
+    # Convert byte offset → chunk index + intra-chunk skip bytes
+    chunk_index = offset // TGRAM_CHUNK_SIZE
+    skip_bytes  = offset % TGRAM_CHUNK_SIZE
 
     buffer: asyncio.Queue[Optional[bytes]] = asyncio.Queue(
         maxsize=Config.PREFETCH_CHUNKS
     )
 
     async def _fill_buffer() -> None:
-        first = True
+        first_chunk = True
         try:
             while True:
                 try:
                     async for chunk in client.stream_media(
                         message,
                         offset=chunk_index,
-                        chunk_size=chunk_size,
+                        limit=0,        # 0 = stream everything from offset
                     ):
-                        if first and skip_bytes:
-                            # Trim the partial first chunk to honour byte offset
-                            chunk = chunk[skip_bytes:]
-                            first = False
-                        else:
-                            first = False
+                        # Trim the first chunk to honour the byte offset
+                        if first_chunk:
+                            first_chunk = False
+                            if skip_bytes:
+                                chunk = chunk[skip_bytes:]
                         if chunk:
-                            await buffer.put(chunk)
-                    break
+                            await buffer.put(bytes(chunk))
+                    break  # finished cleanly
                 except FloodWait as fw:
                     log.warning(
                         "FloodWait %ss on msg %s — retrying",
@@ -80,7 +84,7 @@ async def iter_file(
         except Exception as exc:
             log.error("Buffer fill error for msg %s: %s", message_id, exc)
         finally:
-            await buffer.put(None)  # sentinel
+            await buffer.put(None)  # sentinel — always signals end
 
     filler = asyncio.create_task(_fill_buffer())
     try:
