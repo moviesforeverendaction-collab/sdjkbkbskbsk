@@ -5,6 +5,17 @@ import signal
 import sys
 import time
 
+import pyrogram.utils
+# ── Patch Pyrogram's hardcoded MIN_CHANNEL_ID ────────────────────────────────
+# Pyrogram 2.0.106 has MIN_CHANNEL_ID = -1002147483647.
+# Telegram now issues channel IDs more negative than that (e.g. -1003144372708).
+# Pyrogram rejects them locally before even contacting Telegram, causing
+# "Peer id invalid". Patching the constant fixes it permanently.
+# See: https://github.com/pyrogram/pyrogram/pull/1430
+pyrogram.utils.MIN_CHANNEL_ID = -1007852516352
+pyrogram.utils.MIN_CHAT_ID = -999999999999
+# ─────────────────────────────────────────────────────────────────────────────
+
 import uvloop
 
 from bot.config import Config
@@ -23,44 +34,7 @@ log = logging.getLogger(__name__)
 _BOOT_TIME = time.time()
 
 
-async def _send_startup_message(pool: ClientPool, chat: object) -> None:
-    """Send a detailed startup report to the storage channel."""
-    import pyrogram
-    pairs = Config.api_pairs()
-    uptime_ts = int(_BOOT_TIME)
-
-    text = (
-        "🟢 **FileStreamBot Started**\n"
-        "─────────────────────────\n"
-        f"🤖 **Channel:** {getattr(chat, 'title', '?')} (`{getattr(chat, 'id', '?')}`)\n"
-        f"🔑 **API Apps:** {len(pairs)} client(s) active\n"
-        f"📦 **Chunk Size:** {Config.CHUNK_SIZE // 1024} KB\n"
-        f"⚡ **Prefetch:** {Config.PREFETCH_CHUNKS} chunks\n"
-        f"🌐 **Base URL:** `{Config.BASE_URL}`\n"
-        f"🗄 **DB:** `{Config.DB_NAME}`\n"
-        f"🔴 **Redis:** {'enabled' if Config.REDIS_URL else 'disabled'}\n"
-        f"👑 **Owners:** {len(Config.OWNER_IDS)} configured\n"
-        f"🔒 **Upload restricted:** {'yes' if Config.OWNER_ONLY_UPLOAD else 'no (anyone can upload)'}\n"
-        "─────────────────────────\n"
-        f"🐍 Python `{platform.python_version()}` · "
-        f"Pyrogram `{pyrogram.__version__}`\n"
-        f"🖥 `{platform.system()} {platform.release()}`\n"
-        f"🕐 Started at `{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(uptime_ts))}`"
-    )
-
-    try:
-        await pool.primary().send_message(Config.CHANNEL_ID, text)
-        log.info("  Startup message sent to channel.")
-    except Exception as exc:
-        log.warning("  Could not send startup message to channel: %s", exc)
-
-
 async def _cleanup_loop() -> None:
-    """
-    Belt-and-suspenders sweep for expired links.
-    MongoDB TTL handles most deletions, but this catches any that slip through
-    during the up-to-60s TTL window.  Runs every hour.
-    """
     while True:
         await asyncio.sleep(3600)
         try:
@@ -79,57 +53,35 @@ async def main() -> None:
     log.info("  Chunk size: %d KB", Config.CHUNK_SIZE // 1024)
     log.info("  Prefetch chunks: %d", Config.PREFETCH_CHUNKS)
 
-    # Set up MongoDB indexes (including the TTL index on expires_at)
     await ensure_indexes()
     log.info("  MongoDB indexes ready.")
 
-    # Start Telegram client pool (1 or 2 clients depending on env vars)
     pool = ClientPool()
     await pool.start()
 
-    # Resolve the storage channel peer so Pyrogram caches the access hash.
-    # On a fresh session, get_chat() fails on private channels the bot hasn't
-    # interacted with. We fall back to walking dialogs to find it.
-    chat = None
+    # Verify channel is accessible now that the MIN_CHANNEL_ID patch is applied
     try:
         chat = await pool.primary().get_chat(Config.CHANNEL_ID)
-        log.info("  Storage channel resolved: %s (id=%s)", chat.title, chat.id)
-    except Exception:
-        log.info("  Channel not in peer cache — scanning dialogs...")
-        try:
-            async for dialog in pool.primary().get_dialogs():
-                if dialog.chat and dialog.chat.id == Config.CHANNEL_ID:
-                    chat = dialog.chat
-                    log.info("  Storage channel found: %s", chat.title)
-                    break
-        except Exception as exc:
-            log.warning("  Dialog scan error: %s", exc)
-
-    if chat is None:
+        log.info("  Storage channel: %s (id=%s)", chat.title, chat.id)
+    except Exception as exc:
         log.error(
-            "  Could not resolve storage channel %s.\n"
-            "  Fix: open your channel in Telegram, go to the bot's profile\n"
-            "  and send any message from the bot to the channel manually.\n"
-            "  This forces Telegram to register the bot<->channel relationship.\n"
-            "  Then redeploy.",
-            Config.CHANNEL_ID,
+            "  Could not access storage channel %s: %s\n"
+            "  Make sure the bot is an ADMIN of the channel.",
+            Config.CHANNEL_ID, exc
         )
         await pool.stop()
         return
 
-    # Register all bot handlers on the primary client
     register_handlers(pool.primary())
 
-    # Start aiohttp web server
     runner = await start_server(pool)
 
-    # Send startup report to the storage channel
-    await _send_startup_message(pool, chat)
+    # Send startup message to channel
+    await _send_startup_log(pool, chat)
 
-    # Start hourly expired-link cleanup in the background
     cleanup_task = asyncio.create_task(_cleanup_loop())
 
-    log.info("Bot is running. Press Ctrl+C to stop.")
+    log.info("Bot is running.")
 
     stop = asyncio.Event()
 
@@ -150,8 +102,36 @@ async def main() -> None:
     log.info("Bye!")
 
 
+async def _send_startup_log(pool: ClientPool, chat: object) -> None:
+    pairs = Config.api_pairs()
+    now = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(_BOOT_TIME))
+    boot_secs = round(time.time() - _BOOT_TIME, 1)
+
+    text = (
+        "🟢 **FileStreamBot Started**\n"
+        "─────────────────────────\n"
+        f"🤖 **Channel:** {getattr(chat, 'title', '?')} (`{getattr(chat, 'id', '?')}`)\n"
+        f"🔑 **API Apps:** {len(pairs)} active\n"
+        f"📦 **Chunk size:** {Config.CHUNK_SIZE // 1024} KB\n"
+        f"⚡ **Prefetch:** {Config.PREFETCH_CHUNKS} chunks\n"
+        f"🌐 **Base URL:** `{Config.BASE_URL}`\n"
+        f"🗄 **DB:** `{Config.DB_NAME}`\n"
+        f"🔴 **Redis:** {'enabled' if Config.REDIS_URL else 'disabled'}\n"
+        f"👑 **Owners:** {len(Config.OWNER_IDS)} configured\n"
+        f"🔒 **Upload open:** {'no' if Config.OWNER_ONLY_UPLOAD else 'yes (anyone)'}\n"
+        "─────────────────────────\n"
+        f"🐍 Python `{platform.python_version()}` · "
+        f"Pyrogram `{pyrogram.__version__}`\n"
+        f"🖥 `{platform.system()} {platform.release()}`\n"
+        f"🕐 `{now}` · booted in {boot_secs}s"
+    )
+
+    try:
+        await pool.primary().send_message(Config.CHANNEL_ID, text)
+        log.info("  Startup log sent to channel.")
+    except Exception as exc:
+        log.warning("  Could not send startup log: %s", exc)
+
+
 if __name__ == "__main__":
-    # uvloop.run() installs uvloop as the event loop policy and runs main().
-    # This must be the outermost call — never call uvloop.install() after
-    # an event loop has already started (e.g. inside an async function).
     uvloop.run(main())
