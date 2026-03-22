@@ -87,17 +87,32 @@ async def main() -> None:
     pool = ClientPool()
     await pool.start()
 
-    # Force Pyrogram to resolve and cache the storage channel peer.
-    # Without this, the first forward() call fails with "Peer id invalid"
-    # because Pyrogram hasn't seen this channel in the current session yet.
+    # Resolve the storage channel peer so Pyrogram caches the access hash.
+    # On a fresh session, get_chat() fails on private channels the bot hasn't
+    # interacted with. We fall back to walking dialogs to find it.
+    chat = None
     try:
         chat = await pool.primary().get_chat(Config.CHANNEL_ID)
-        log.info("  Storage channel: %s (id=%s)", chat.title, chat.id)
-    except Exception as exc:
+        log.info("  Storage channel resolved: %s (id=%s)", chat.title, chat.id)
+    except Exception:
+        log.info("  Channel not in peer cache — scanning dialogs...")
+        try:
+            async for dialog in pool.primary().get_dialogs():
+                if dialog.chat and dialog.chat.id == Config.CHANNEL_ID:
+                    chat = dialog.chat
+                    log.info("  Storage channel found: %s", chat.title)
+                    break
+        except Exception as exc:
+            log.warning("  Dialog scan error: %s", exc)
+
+    if chat is None:
         log.error(
-            "  Could not resolve storage channel %s: %s\n"
-            "  Make sure the bot is an ADMIN of that channel.",
-            Config.CHANNEL_ID, exc
+            "  Could not resolve storage channel %s.\n"
+            "  Fix: open your channel in Telegram, go to the bot's profile\n"
+            "  and send any message from the bot to the channel manually.\n"
+            "  This forces Telegram to register the bot<->channel relationship.\n"
+            "  Then redeploy.",
+            Config.CHANNEL_ID,
         )
         await pool.stop()
         return
